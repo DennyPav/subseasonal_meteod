@@ -1,8 +1,0 @@
-__pycache__/
-*.pyc
-.cdsapirc
-output/
-*.grib
-*.idx
-*.partial
-.env
