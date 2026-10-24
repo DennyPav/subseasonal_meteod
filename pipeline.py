@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MeteoD S2S 0.4°: ECDS ECMWF -> ensemble weekly -> city quintiles and approximate map quintiles.
+"""MeteoD S2S 0.4°: ECDS ECMWF -> ensemble weekly -> PNG -> Cloudflare R2.
 
 IMPORTANT: spatially interpolated city thresholds used for maps are an APPROXIMATION,
 not a gridded ERA5 climatology. City histograms use the ORIGINAL per-city thresholds.
@@ -8,6 +8,7 @@ import argparse
 import gzip
 import json
 import os
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -76,60 +77,74 @@ def check_threshold_weeks(indices, thresholds, starts):
 
 
 def request_for(init, param):
-    """ECDS S2S with explicit numerical MARS codes to avoid name ambiguity.
+    """Select S2S data using the *official ECDS form fields*, not raw MARS syntax.
 
-    MARS codes: class 27 = S2S (s2), 167 = 2 m temperature, 228 = total
-    precipitation. Explicit codes avoid the source error in which the ECDS->MARS
-    translation used ambiguous strings `s2` and `2m_temperature`.
+    Mirrors the user-supplied `s2s-forecasts` example:
+        origin / year / month / day / time / level_type / variable /
+        forecast_type / leadtime_hour / data_format / area.
 
-    Temperature: each period [0-24], [24-48], ... is a daily average.
-    Precipitation: use the 24h endpoints of accumulated-from-0 6h fields.
+    The S2S daily 2m temperature is archived as intervals `0_24`, etc.
+    Total precipitation is cumulative since initialization. Request 24-hour
+    endpoints only: subtraction of adjacent endpoints yields daily mm while
+    avoiding downloading 6-hourly steps we do not need for weekly products.
     """
     if param == 't2m':
-        param_code = '167'
-        steps = [f'{i}-{i+24}' for i in range(0, 1104, 24)]
+        variable = '2_m_temperature'
+        leadtimes = [f'{h}_{h+24}' for h in range(0, 1104, 24)]
     elif param == 'tp':
-        param_code = '228'
-        steps = [str(i) for i in range(24, 1105, 24)]
+        variable = 'total_precipitation'
+        leadtimes = [str(h) for h in range(24, 1105, 24)]
     else:
         raise ValueError(f'Parametro non previsto: {param}')
+
     return {
-        'class': '27',      # numerical GRIB MARS class code, S2S (abbreviation s2)
-        'expver': 'prod',
-        'stream': 'enfo',
-        'type': 'pf',
-        'origin': 'ecmf',
-        'levtype': 'sfc',
-        'date': init.strftime('%Y-%m-%d'),
-        'time': '00:00:00',
-        'param': param_code,
-        'step': steps,
-        'area': '54/-14/28/44',
+        'origin': 'ecmwf',
+        'year': init.strftime('%Y'),
+        'month': init.strftime('%m'),
+        'day': init.strftime('%d'),
+        'time': '00:00',
+        'level_type': 'single_level',
+        'variable': [variable],
+        'forecast_type': 'perturbed_forecast',
+        'leadtime_hour': leadtimes,
+        'data_format': 'grib',
+        # Margin for bilinear interpolation at all target-grid boundaries.
+        'area': [54, -14, 28, 44],
     }
 
 
 def download_grib(init, raw_dir):
-    token=os.getenv('ECDS_API_KEY')
+    token = os.getenv('ECDS_API_KEY')
     if not token:
         raise RuntimeError('ECDS_API_KEY non configurata. Usare GitHub Secrets (o variabile ambiente).')
     import cdsapi
-    client=cdsapi.Client(url='https://ecds.ecmwf.int/api',key=token)
-    paths={}
+    client = cdsapi.Client(url='https://ecds.ecmwf.int/api', key=token)
+    paths = {}
     raw_dir.mkdir(parents=True, exist_ok=True)
-    for var in ('t2m','tp'):
-        path=raw_dir / f'ecmwf_s2s_{var}_{init:%Y%m%d}.grib'
-        if not path.exists() or path.stat().st_size==0:
-            print('ECDS download', var, init.strftime('%Y%m%d'),flush=True)
-            tmp=path.with_suffix('.grib.partial')
-            if tmp.exists():tmp.unlink()
-            client.retrieve('s2s-forecasts',request_for(init,var),str(tmp))
+    for var in ('t2m', 'tp'):
+        path = raw_dir / f'ecmwf_s2s_{var}_{init:%Y%m%d}.grib'
+        if not path.exists() or path.stat().st_size == 0:
+            request = request_for(init, var)
+            print('ECDS download', var, init.strftime('%Y%m%d'), flush=True)
+            print('  variable =', request['variable'], flush=True)
+            print('  leadtime_hour =', len(request['leadtime_hour']), 'step', flush=True)
+            tmp = path.with_suffix('.grib.partial')
+            if tmp.exists():
+                tmp.unlink()
+            # ECDS CDS-API returns a job/result whose download() retrieves the GRIB.
+            client.retrieve('s2s-forecasts', request).download(str(tmp))
             if not tmp.exists() or tmp.stat().st_size < 100:
                 raise RuntimeError(f'Download ECDS vuoto: {tmp}')
-            if tmp.open('rb').read(4)!=b'GRIB':
-                raise RuntimeError(f'Non è un file GRIB: {tmp}. Controlla la risposta ECDS.')
+            with tmp.open('rb') as f:
+                magic = f.read(4)
+            if magic != b'GRIB':
+                raise RuntimeError(
+                    f'La risposta ECDS non è un GRIB (magic={magic!r}): {tmp}. '
+                    'Controlla log ECDS e data_format.'
+                )
             tmp.replace(path)
-        print('GRIB',path,'MB=',round(path.stat().st_size/1e6,1),flush=True)
-        paths[var]=path
+        print('GRIB', path, 'MB=', round(path.stat().st_size / 1e6, 1), flush=True)
+        paths[var] = path
     return paths
 
 
@@ -215,6 +230,12 @@ def weekly_interpolated(da, starts, var):
         agg=chunk.mean('day') if var=='t2m' else chunk.sum('day')
         weeks.append(agg)
     result=xr.concat(weeks,dim='week').assign_coords(week=np.arange(1,6))
+    # GRIB may use 0..360 longitude coordinates. Convert to -180..180 before
+    # interpolating across the Greenwich meridian (our target spans -12..42).
+    lon = ((result['longitude'].values + 180.0) % 360.0) - 180.0
+    result = result.assign_coords(longitude=lon).sortby('longitude')
+    if np.unique(lon).size != lon.size:
+        raise RuntimeError(f'{var}: longitude duplicate after 0..360 conversion')
     result=result.interp(latitude=LATS,longitude=LONS,method='linear',assume_sorted=False).astype('float32')
     if not np.all(np.isfinite(result.values)):
         raise ValueError(f'{var}: valori NaN dopo interpolazione 0.4°. Verificare area ECDS.')
@@ -303,26 +324,12 @@ def build_map_probabilities(tweek,pweek, thresholds, indices, starts):
         yield n,start,arrays,interpolator.lat2d,interpolator.lon2d
 
 
-def write_probability_netcdf(tweek,pweek, indices, thresholds, starts, target):
-    # Save actual model members as separate NetCDF for reproducibility / future ERA5 calibration.
-    ds=xr.Dataset({'t2m':tweek,'tp':pweek})
-    ds=ds.assign_coords(week_start=('week', [np.datetime64(t.replace(tzinfo=None)) for t in starts]))
-    ds['t2m'].attrs['units']='degC';ds['tp'].attrs['units']='mm'
-    ds.attrs['interpolation']='bilinear from ECDS S2S 1.5 degree to 0.4 degree'
-    try:
-        import h5netcdf  # noqa: F401
-        ds.to_netcdf(target, engine='h5netcdf',encoding={k:{'compression':'gzip','compression_opts':3} for k in ('t2m','tp')})
-    except ModuleNotFoundError:
-        print('WARNING: h5netcdf non presente: NetCDF3 non compresso (solo fallback locale)')
-        ds.to_netcdf(target, engine='scipy')
-
-
 def render_histograms(city_json,thresholds,init,folder):
     from plotting import plot_city_combined
     folder.mkdir(exist_ok=True,parents=True)
     for city, weeks in city_json.items():
         starts=sorted(weeks.keys())
-        out=folder / f'{city}_{starts[0]}.webp'
+        out=folder / f'{city}_{starts[0]}.png'
         plot_city_combined(city,starts,weeks,thresholds[city],str(out),init.strftime('%d/%m/%Y'))
     print(f'Grafici località prodotti: {len(city_json)}',flush=True)
 
@@ -340,47 +347,115 @@ def render_maps(tweek,pweek,indices,thresholds,starts,init,folder):
             plotting.plot_terciles_week(key,arrays[v],v,str(folder),lat2d,lon2d)
 
 
-def main(argv=None):
-    cli=argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('--date',help='Emissione ECMWF (YYYY-MM-DD, qualunque giorno); omesso = oggi UTC meno 2 giorni')
-    cli.add_argument('--output',default='output',help='Directory degli output')
-    cli.add_argument('--grib-dir', help='GRIB già scaricati; salta richiesta ECDS')
-    cli.add_argument('--no-maps',action='store_true',help='Salta mappe Cartopy (test rapidi)')
-    cli.add_argument('--no-plots',action='store_true',help='Salta tutti i plot, crea solo JSON/NetCDF')
-    cli.add_argument('--dry-run',action='store_true',help='Valida asset e stampa richieste senza scaricare')
-    args=cli.parse_args(argv)
-    init=date_from_args(args.date);starts=week_starts(init)
-    indices,thresholds=load_assets()
-    check_threshold_weeks(indices,thresholds,starts)
-    print('RUN ECMWF S2S UTC',init.strftime('%Y-%m-%d'),'Grid',GRID_SHAPE, 'Locations',len(indices),flush=True)
-    print('Weeks:',', '.join(s.strftime('%Y-%m-%d') for s in starts),flush=True)
-    if args.dry_run:
-        print(json.dumps({p:request_for(init,p) for p in ('t2m','tp')},indent=2));return
-    output=Path(args.output).resolve()/init.strftime('%Y%m%d')
-    output.mkdir(parents=True,exist_ok=True)
-    if args.grib_dir:
-        raw=Path(args.grib_dir).resolve()
-        paths={v:raw/f'ecmwf_s2s_{v}_{init:%Y%m%d}.grib' for v in ('t2m','tp')}
-        for p in paths.values():
-            if not p.exists():raise FileNotFoundError(p)
-    else:
-        paths=download_grib(init,output/'grib')
-    t=normalize_da(read_grib_da(paths['t2m']),init,'t2m')
-    p=normalize_da(read_grib_da(paths['tp']),init,'tp')
-    if not np.array_equal(t['member'].values,p['member'].values):
-        raise RuntimeError('Membri temperatura e precipitazione non allineati')
-    tw=weekly_interpolated(t,starts,'t2m')
-    pw=weekly_interpolated(p,starts,'tp')
-    del t,p
-    write_probability_netcdf(tw,pw,indices,thresholds,starts,output/'ensemble_settimanale_04.nc')
-    city_data=city_probabilities(tw,pw,indices,thresholds,starts)
-    json_path=output/f'province_quintili_{init:%Y_%m_%d}.json'
-    json_path.write_text(json.dumps(city_data,indent=2,ensure_ascii=False),encoding='utf-8')
-    print('JSON',json_path,flush=True)
-    if not args.no_plots:
-        render_histograms(city_data,thresholds,init,output/'PLOT_istogrammi')
-        if not args.no_maps:render_maps(tw,pw,indices,thresholds,starts,init,output/'PLOT')
-    (output/'METODOLOGIA.txt').write_text('''S2S real-time ECMWF, ensemble perturbato, 0.4 degree bilinear interpolation.\nTemperature: daily mean 24h, weekly average in degC.\nPrecipitation: 24h difference between cumulative from init, weekly sum in mm.\nProvince plots: probability thresholds from per-city soglie_settimanali_med.\nRegional maps: thresholds linearly interpolated from station/province reference points\nand nearest-neighbour extrapolation beyond hull; these are APPROXIMATE, not ERA5 gridded.\nMap 3-category colors use the original 40/20/40 reshaped scheme, not true terciles.\nNO downscaling or model-bias correction.\n''')
-    print('DONE', output,flush=True)
+def validate_r2_config():
+    """Check credentials before initiating an expensive ECDS download."""
+    names = ('R2_ACCOUNT_ID', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY')
+    absent = [n for n in names if not os.environ.get(n)]
+    if absent:
+        raise RuntimeError('Credenziali Cloudflare R2 mancanti: ' + ', '.join(absent) +
+                           '. Configurarle nei GitHub Actions Secrets.')
 
-if __name__=='__main__': main()
+
+def upload_pngs_to_r2(image_dir, expected_count, client=None):
+    """Publish *only* PNG images to the original `settimanali` bucket root.
+
+    The previous Leonardo workflow used `upload_file(..., bucket, filename)`;
+    the object key was the bare filename, NOT a prefix such as `PLOT/`.
+    An explicit R2_PREFIX can override this for a differently configured site.
+    """
+    from pathlib import Path
+    image_dir = Path(image_dir)
+    images = sorted(image_dir.rglob('*.png'))
+    if len(images) != expected_count:
+        raise RuntimeError(f'PNG prodotti: {len(images)}, attesi: {expected_count}. Upload annullato.')
+    names = [p.name for p in images]
+    if len(set(names)) != len(names):
+        raise RuntimeError('Nomi PNG duplicati fra mappe e località: upload annullato.')
+    if any(p.stat().st_size < 100 for p in images):
+        raise RuntimeError('PNG vuoti o incompleti: upload annullato.')
+    validate_r2_config()
+
+    bucket = os.getenv('R2_BUCKET', 'settimanali').strip()
+    if not bucket:
+        raise RuntimeError('R2_BUCKET vuoto')
+    prefix = os.getenv('R2_PREFIX', '').strip().strip('/')
+    if client is None:
+        import boto3
+        from botocore.config import Config
+        client = boto3.client(
+            's3', endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com",
+            aws_access_key_id=os.environ['R2_ACCESS_KEY_ID'],
+            aws_secret_access_key=os.environ['R2_SECRET_ACCESS_KEY'],
+            region_name='auto',
+            config=Config(retries={'max_attempts': 5, 'mode': 'standard'}),
+        )
+    extra = {'ContentType': 'image/png', 'CacheControl': 'public, max-age=300'}
+    print(f'UPLOAD R2: {len(images)} PNG nel bucket {bucket}, prefix={prefix or "(radice)"}', flush=True)
+    for i, path in enumerate(images, 1):
+        key = f'{prefix}/{path.name}' if prefix else path.name
+        # Exceptions must propagate: GitHub must report a failed upload.
+        client.upload_file(str(path), bucket, key, ExtraArgs=extra)
+        if i % 20 == 0 or i == len(images):
+            print(f'Caricati {i}/{len(images)} PNG', flush=True)
+    return len(images)
+
+
+def main(argv=None):
+    cli = argparse.ArgumentParser(description=__doc__)
+    cli.add_argument('--date', help='Emissione ECMWF YYYY-MM-DD; omesso = oggi UTC meno 2 giorni')
+    cli.add_argument('--output', default='output', help='Directory locale per i SOLI PNG')
+    cli.add_argument('--grib-dir', help='GRIB precedentemente scaricati; evita la richiesta ECDS')
+    cli.add_argument('--no-maps', action='store_true', help='Genera soltanto gli istogrammi provinciali')
+    cli.add_argument('--no-upload', action='store_true', help='Genera PNG senza inviarli a Cloudflare (prove locali)')
+    cli.add_argument('--dry-run', action='store_true', help='Valida asset e stampa richieste senza scaricare o caricare')
+    args = cli.parse_args(argv)
+    init = date_from_args(args.date)
+    starts = week_starts(init)
+    indices, thresholds = load_assets()
+    check_threshold_weeks(indices, thresholds, starts)
+    print('RUN ECMWF S2S UTC', init.strftime('%Y-%m-%d'),
+          'Grid', GRID_SHAPE, 'Locations', len(indices), flush=True)
+    print('Weeks:', ', '.join(s.strftime('%Y-%m-%d') for s in starts), flush=True)
+    if args.dry_run:
+        print(json.dumps({p: request_for(init, p) for p in ('t2m', 'tp')}, indent=2))
+        return
+    if not args.no_upload:
+        validate_r2_config()  # fail early if secrets are missing
+
+    # The only persistent products are PNG. Raw GRIB are downloaded to a
+    # TemporaryDirectory and deleted automatically even when processing fails.
+    image_dir = Path(args.output).resolve() / init.strftime('%Y%m%d')
+    image_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='meteod_ecdsv4_') as temp:
+        if args.grib_dir:
+            raw = Path(args.grib_dir).resolve()
+            paths = {v: raw / f'ecmwf_s2s_{v}_{init:%Y%m%d}.grib' for v in ('t2m', 'tp')}
+            for path in paths.values():
+                if not path.is_file():
+                    raise FileNotFoundError(path)
+        else:
+            paths = download_grib(init, Path(temp))
+        t = normalize_da(read_grib_da(paths['t2m']), init, 't2m')
+        p = normalize_da(read_grib_da(paths['tp']), init, 'tp')
+        if not np.array_equal(t['member'].values, p['member'].values):
+            raise RuntimeError('Membri temperatura e precipitazione non allineati')
+        tw = weekly_interpolated(t, starts, 't2m')
+        pw = weekly_interpolated(p, starts, 'tp')
+        del t, p
+        city_data = city_probabilities(tw, pw, indices, thresholds, starts)
+        render_histograms(city_data, thresholds, init, image_dir / 'citta')
+        if not args.no_maps:
+            render_maps(tw, pw, indices, thresholds, starts, init, image_dir / 'mappe')
+    expected = len(indices) + (0 if args.no_maps else 2 * len(starts))
+    if args.no_upload:
+        pngs = list(image_dir.rglob('*.png'))
+        if len(pngs) != expected:
+            raise RuntimeError(f'PNG generati: {len(pngs)}; attesi: {expected}')
+        print(f'DONE (senza upload): {len(pngs)} PNG in {image_dir}', flush=True)
+    else:
+        upload_pngs_to_r2(image_dir, expected)
+        print(f'DONE: {expected} PNG caricati su R2', flush=True)
+
+
+if __name__ == '__main__':
+    main()

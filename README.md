@@ -1,96 +1,80 @@
-# MeteoD - Settimanali ECMWF S2S, v2 (senza Leonardo)
+# MeteoD S2S ECDS → PNG → Cloudflare R2 (v4)
 
-## Cosa fa
-1. Scarica **temperature medie giornaliere** e **precipitazioni cumulative** dell'**ensemble perturbato ECMWF S2S** dal portale **ECDS** (dataset `s2s-forecasts`).
-2. Ottiene gli accumuli quotidiani di pioggia per differenza delle precipitazioni cumulative (S2S `tp`); la temperatura viene convertita da K a °C.
-3. Converte in **5 settimane lunedì-domenica complete**, partendo dal primo lunedì non precedente alla run. Temperatura: media sui sette giorni; precipitazione: totale sui sette giorni.
-4. Esegue **interpolazione bilineare a 0,4°** prima del confronto con le soglie. Griglia di **58 x 136** punti, latitudini **52,0; 51,6; …; 29,2** (decrescenti) e longitudini **−12; −11,6; …; 42** (crescenti), mantenendo invariati gli indici del file `province_index_mediterraneo_0.4.json`.
-5. Calcola i cinque quintili per ciascuna località usando i **valori originali** di `soglie_settimanali_med.pkl`, qui esportato nel file sicuro `assets/soglie_settimanali_med.json.gz` (151 località, 257 settimane da febbraio 2026 a dicembre 2030).
-6. Produce gli **stessi tipi di plot** del vecchio script Leonardo, con la parte grafica preservata in `plotting.py`: istogramma temperatura/precipitazione per località (prime quattro settimane); mappa per ogni settimana e variabile (5×2 WebP).
-7. Scrive il JSON delle località nel vecchio formato `T_1..T_5`, `P_1..P_5` e un NetCDF con i valori dell'ensemble settimanale interpolato.
+**Senza Leonardo.** Ogni giorno GitHub Actions scarica da ECMWF ECDS la previsione S2S della **data UTC di due giorni prima**. Interpola i membri dell'ensemble sulla griglia **0,4°** degli indici `assets/province_index_mediterraneo_0.4.json`; calcola i quintili rispetto alle soglie di `assets/soglie_settimanali_med.json.gz` e genera i plot MeteoD in **PNG**. Alla fine li carica su Cloudflare R2. Non crea NetCDF, JSON di risultati, né altri output da pubblicare. I GRIB intermedi sono in una cartella temporanea cancellata automaticamente.
 
-### Importante: limitazione climatologica per le MAPPE
-Il file di soglie fornito contiene valori **solo per località**, non una climatologia ERA5 di griglia. Le mappe v1 utilizzano dunque la **interpolazione spaziale lineare delle soglie tra le 151 località**, con assegnazione dal punto più vicino fuori dall'inviluppo delle località. Località con identico indice sono mediate **solo per costruire le mappe**. Le località e i relativi istogrammi mantengono **ognuna le proprie soglie originali**, senza mediare o interpolare soglie tra città.
+## Directory di Cloudflare confermata dal vecchio codice
 
-Le mappe v1 sono quindi una **APPROSSIMAZIONE**: mantengono stile e filename Leonardo, ma non possono coincidere scientificamente con le mappe originali. La fase successiva consigliata sarà una **climatologia ERA5 grigliata** a 0,4°, in modo da poter calcolare quintili senza interpolare soglie tra città.
+Il codice Leonardo aveva `R2_BUCKET_NAME = "settimanali"` e chiamava `upload_file(file_path, "settimanali", filename)`. Quindi il percorso è la **radice del bucket `settimanali`**, non `settimanali/PLOT/` né altre sottocartelle. La v4 replica questa disposizione: `R2_BUCKET=settimanali` e `R2_PREFIX=''`. È possibile impostare un prefisso diverso soltanto se il sito usa realmente un'altra directory.
 
-Per replicare l'aspetto delle mappe viene conservato il vecchio trucco grafico dei tre gruppi `Q1+Q2`, `Q3`, `Q4+Q5` con riscalatura del gruppo centrale: **non sono tercili meteorologici veri**.
-
-Non vengono effettuati downscaling statistico, correzione bias o calibrazione su reforecast: è la v1 sperimentale, da confrontare con i plot Leonardo.
-
-## Primo setup su GitHub
-
-1. Crea un nuovo repository (preferibilmente **privato**) e carica **il contenuto** di questa cartella, compresa `.github/workflows/subseasonal.yml` e `assets/`. Non caricare il vecchio script con chiavi R2 dentro.
-2. Accedi a https://ecds.ecmwf.int/datasets/s2s-forecasts?tab=download e **accetta le condizioni/licenze** del dataset.
-3. Vai su https://ecds.ecmwf.int/how-to-api e recupera il tuo token personale ECMWF.
-4. Su GitHub vai in **Settings → Secrets and variables → Actions → New repository secret** e crea `ECDS_API_KEY` con quel token. **Non** inserirlo negli script.
-5. Vai in **Actions → MeteoD ECMWF S2S Settimanali → Run workflow**. Per la prima prova lascia il campo `run_date` **vuoto**. Verrà selezionata automaticamente la data UTC di **due giorni prima**, indipendentemente dal giorno della settimana. Per un test storico puoi inserire ad esempio `2026-10-22`.
-6. Verifica i log. Nel riepilogo della run scarica l'artifact `meteod-s2s-output-N`, con WebP, JSON e NetCDF.
-
-È presente una pianificazione **tutti i giorni alle 12:15 UTC**, che richiede la run ECMWF S2S delle 00 UTC di due giorni prima (circa 60 ore dopo l'inizializzazione). ECMWF S2S è giornaliero dall'aggiornamento di novembre 2024. Nessun upload su Cloudflare R2 per questa **prima versione di validazione**.
-
-### Esecuzione locale
-
-Richiede Python 3.11/3.12, librerie in `requirements.txt` ed ecCodes per cfgrib. In Linux, esegui prima `sudo apt-get install libeccodes0 libeccodes-dev`.
-
-```bash
-pip install -r requirements.txt
-export ECDS_API_KEY='IL_TUO_TOKEN'
-python pipeline.py --dry-run
-python pipeline.py --output output
-# Per una emissione storica specifica:
-python pipeline.py --date 2026-10-22 --output output
-```
-
-Per ripetere senza riscaricare GRIB già presenti, la pipeline salta i file non vuoti. Per usare file GRIB propri: `python pipeline.py --date 2026-10-22 --grib-dir MIA_CARTELLA` con nomi `ecmwf_s2s_t2m_20261022.grib` e `ecmwf_s2s_tp_20261022.grib`.
-
-### Output attesi
+Esempi di chiavi R2:
 
 ```text
-output/20261022/
-├── grib/
-│   ├── ecmwf_s2s_t2m_20261022.grib
-│   └── ecmwf_s2s_tp_20261022.grib
-├── ensemble_settimanale_04.nc
-├── province_quintili_2026_10_22.json
-├── METODOLOGIA.txt
-├── PLOT/
-│   ├── subseasonal_20261026_2tp.webp
-│   ├── subseasonal_20261026_tpp.webp
-│   ├── ... (cinque settimane, 10 mappe)
-└── PLOT_istogrammi/
-    ├── Bologna_20261026.webp
-    ├── Milano_20261026.webp
-    └── ... (151 località con 4 settimane per grafico)
+settimanali/subseasonal_20261026_2tp.png
+settimanali/subseasonal_20261026_tpp.png
+settimanali/Bologna_20261026.png
+settimanali/Milano_20261026.png
 ```
 
-### Test
+**Nota:** il vecchio flusso caricava file `.webp`; questa versione salva e carica `.png`, per esplicita richiesta. Le pagine/app MeteoD che puntano ai nomi `.webp` devono essere aggiornate ai `.png`. Non viene cancellato alcun vecchio oggetto `.webp` su R2.
+
+## Configurazione GitHub
+
+1. Caricare nel repository il **contenuto** della directory (compresa `.github/workflows/`). Non caricare vecchi sorgenti che contengono chiavi cloud in chiaro.
+2. In **GitHub → Settings → Secrets and variables → Actions → New repository secret**, creare:
+   - `ECDS_API_KEY` — token personale ECMWF ECDS;
+   - `R2_ACCOUNT_ID` — account ID Cloudflare;
+   - `R2_ACCESS_KEY_ID` — Access Key di una credenziale R2 con autorizzazione di scrittura sul bucket `settimanali`;
+   - `R2_SECRET_ACCESS_KEY` — Secret Key associata.
+3. Rigenerare/revocare le vecchie chiavi R2 che apparivano nello script Leonardo e **non riutilizzarle**.
+4. Accettare la licenza del dataset su https://ecds.ecmwf.int/datasets/s2s-forecasts?tab=download.
+5. In **Actions → MeteoD ECMWF S2S → Cloudflare R2 → Run workflow**, lasciare `run_date` vuoto. Il cron automatico gira tutti i giorni alle **12:15 UTC**.
+
+## Output
+
+Per una data ECMWF come `2026-10-22` genera **161 PNG**:
+
+- 10 mappe: 5 settimane × temperatura (`2tp`) e precipitazione (`tpp`).
+- 151 istogrammi per le località del file `province_index_mediterraneo_0.4.json`, ciascuno con le prime quattro settimane.
+
+Gli unici file di output locali sono sotto `output/20261022/mappe/` e `output/20261022/citta/`, tutti `.png`. Non esistono JSON di output, NetCDF o matrici salvate. I riferimenti `assets/*.json*` sono **input statici indispensabili** per costruire gli istogrammi e i campi di probabilità.
+
+Il caricamento sul bucket mantiene i soli nomi dei file, senza la struttura `mappe/` e `citta/`, come faceva Leonardo. L'header HTTP `Content-Type` è `image/png` e il TTL cache è 300 secondi, utile perché gli oggetti per una stessa settimana possono venire aggiornati il giorno dopo. Le mappe future vengono sovrascritte dalla previsione più recente se il loro nome coincide; gli oggetti più vecchi non vengono cancellati.
+
+## Esecuzione locale senza upload
 
 ```bash
+python -m pip install -r requirements.txt
 python tests/test_offline.py
+python pipeline.py --dry-run
+python pipeline.py --date 2026-10-22 --no-upload --output output
 ```
 
-È un test offline con 12 membri sintetici, nessuna chiamata ECMWF. Verifica differenza delle precipitazioni cumulative, griglia, interpolazione, cinque quintili, tutte le località, struttura delle mappe, NetCDF e un istogramma WebP. Il download reale ECDS, i GRIB scaricati e le mappe Cartopy complete **devono ancora essere verificati alla prima esecuzione Actions**.
+L'esecuzione normale `python pipeline.py --output output` esegue anche l'upload su Cloudflare e richiede i secrets come variabili ambiente. `--grib-dir DIR` può leggere GRIB già scaricati, senza eliminarli. `--no-maps` genera soltanto le immagini delle località.
 
-### Modifiche v2: data giornaliera e errore MARS `Ambiguous`
+## Limitazioni della v3
 
-* Se non viene passato `--date`, la pipeline usa la data **UTC di due giorni prima**; dal 12 novembre 2024 ECMWF S2S è giornaliero, non solo lunedì e giovedì.
-* La richiesta ECDS viene costruita nel formato **MARS-like** con codici numerici: `class=27` (S2S), `param=167` (temperatura 2 m), `param=228` (precipitazione totale). Questo evita di inviare i nomi descrittivi ambigui che sono comparsi nel log `MarsRuntimeError`.
-* Dopo il download tutte le altre funzioni della v1 (interpolazione 0,4°, province, soglie, mappe e istogrammi) rimangono inalterate.
-* **Importante**: i codici sono quelli ufficiali ECMWF, ma non è stato possibile provare dal vivo che il backend ECDS accetti `class=27` nella sintassi MARS-like. Se si riceve un errore diverso (ad es. class non valida), il log della prima esecuzione sarà necessario per adeguare la richiesta. Non attribuire eventuali errori di sintassi alla mancanza dei dati.
-* Il ritardo di 48 ore è un vincolo minimo, **non una garanzia di pubblicazione** a un preciso minuto. Se il file richiesto non è stato ancora archiviato, il job fallisce e non utilizza silenziosamente una data precedente.
+- **Non è una correzione del bias**: esegue soltanto interpolazione bilineare dei campi ECMWF su 0,4°.
+- Le soglie fornite sono per *località*. Le mappe utilizzano soglie interpolate spazialmente e sono quindi **approssimazioni**, non quintili ottenuti da una climatologia ERA5 grigliata.
+- Le aree colorate continuano a usare l'approssimazione grafica originale `40/20/40` riscalata, **non veri tercili**.
+- L'accesso ECMWF reale, la decodifica dei GRIB scaricati, le mappe Cartopy e l'upload reale R2 necessitano della prima esecuzione completa su GitHub. I test offline verificano calcoli e PNG e simulano l'upload senza trasferire dati.
+- L'upload R2 non è una transazione atomica: se fallisce dopo alcuni oggetti, il workflow termina in errore e alcuni file potrebbero risultare già aggiornati; basta rilanciare la run con la stessa data.
+- Per ora le soglie del file coprono il 2026–2030. Quando non sono disponibili per una data, la procedura si ferma senza pubblicare risultati incompleti.
 
-### Errori comuni
+## Dettagli ECMWF
 
-- `403` o problemi di autorizzazione: accetta la licenza ECDS con l'account associato al token.
-- `MarsRuntimeError`/`Ambiguous`: nella v2 i nomi ambigui sono stati sostituiti da codici numerici. Se persiste, confrontare i log con la richiesta MARS-like generata dal portale ECDS.
-- `Step incompleti`: il forecast ottenuto non contiene gli intervalli 24h previsti; non proseguire con aggregazioni parziali.
-- `Precipitazione cumulata in diminuzione`: fermarsi e controllare i metadati del GRIB, nessuna conversione automatica cieca.
-- `Soglie non disponibili`: il file contiene solo settimane **2026–2030**. Nuove date richiedono l'aggiornamento della climatologia di riferimento.
-- I pacchetti Cartopy possono scaricare file Natural Earth (coste e confini) alla prima creazione delle mappe, richiedendo accesso Internet.
+Le richieste ora usano **esattamente i nomi dei campi del form ECDS**: `origin`, `year`, `month`, `day`, `time`, `level_type`, `variable`, `forecast_type`, `leadtime_hour`, `data_format`, `area`. Non si usa più la richiesta MARS manuale con `class`, `param` e `step`.
 
-## Fonti tecniche
-- https://ecds.ecmwf.int/how-to-api
-- https://ecds.ecmwf.int/datasets/s2s-forecasts?tab=overview
-- https://confluence.ecmwf.int/spaces/S2S/pages/26903293/Parameters
+Si effettuano **due richieste** al dataset `s2s-forecasts` per evitare che i lead times delle due variabili siano mescolati:
+
+- `variable=["2_m_temperature"]`: i 46 intervalli giornalieri `0_24`, `24_48`, ..., `1080_1104`;
+- `variable=["total_precipitation"]`: i 46 accumuli progressivi alle ore `24`, `48`, ..., `1104`. Vengono differenziati per ottenere il totale di ogni singolo giorno (mm). Scaricare anche i 6-hourly non serve per questa applicazione. La richiesta usa l'area ampliata `[54, -14, 28, 44]` esclusivamente per mantenere i punti necessari all'interpolazione bilineare: l'output finale resta sulla griglia 0,4° `[52, -12, 29, 42]`. Le longitudini GRIB 0–360° vengono ricondotte a −180–180° prima di interpolare.
+
+L'accesso reale a ECDS non è stato verificato offline: **non è possibile garantire che l'errore interno `MarsRuntimeError` non si ripresenti** anche passando dalla sintassi ECDS ufficiale.
+
+Riferimenti:
+- https://ecds.ecmwf.int/datasets/s2s-forecasts?tab=download
 - https://confluence.ecmwf.int/spaces/S2S/pages/27399606/Total+precipitation
+- https://confluence.ecmwf.int/spaces/DAC/pages/540541961/Examples+of+the+current+and+future+retrieval+requests
+
+
+Riferimenti: https://ecds.ecmwf.int/how-to-api e https://confluence.ecmwf.int/spaces/DAC/pages/540541961/Examples+of+the+current+and+future+retrieval+requests.
