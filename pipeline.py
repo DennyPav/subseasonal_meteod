@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""MeteoD S2S 0.4°: ECDS ECMWF -> ensemble weekly -> city quintiles and approximate map quintiles.
+
+IMPORTANT: spatially interpolated city thresholds used for maps are an APPROXIMATION,
+not a gridded ERA5 climatology. City histograms use the ORIGINAL per-city thresholds.
+"""
+import argparse
+import gzip
+import json
+import os
+from pathlib import Path
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+from scipy.spatial import Delaunay
+
+BASE = Path(__file__).resolve().parent
+DATA_DIR = BASE / 'assets'
+LATS = np.round(52.0 - np.arange(58, dtype=np.float64) * 0.4, 6)
+LONS = np.round(-12.0 + np.arange(136, dtype=np.float64) * 0.4, 6)
+GRID_SHAPE = (len(LATS), len(LONS))
+QUANTILES = (20, 40, 60, 80)
+
+
+def date_from_args(value=None, max_age_hours=60):
+    if value:
+        d = datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+        if d.weekday() not in (0, 3):
+            raise ValueError('Le emissioni ECMWF S2S previste sono lunedì e giovedì: scegli una di queste date')
+        return d
+    d = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    while d.weekday() not in (0, 3):
+        d -= timedelta(days=1)
+    return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def week_starts(init):
+    monday = init + timedelta(days=(7-init.weekday()) % 7)
+    return [monday + timedelta(days=7*i) for i in range(5)]
+
+
+def load_assets():
+    with open(DATA_DIR / 'province_index_mediterraneo_0.4.json', encoding='utf-8') as f:
+        indices = json.load(f)
+    with gzip.open(DATA_DIR / 'soglie_settimanali_med.json.gz','rt',encoding='utf-8') as f:
+        thresholds = json.load(f)
+    for city, (i, j) in indices.items():
+        if not (0 <= i < GRID_SHAPE[0] and 0 <= j < GRID_SHAPE[1]):
+            raise ValueError(f'Indice non compatibile con la griglia 0.4°: {city} = {[i,j]}')
+        if city not in thresholds:
+            raise ValueError(f'Soglie mancanti per {city}')
+    return indices, thresholds
+
+
+def check_threshold_weeks(indices, thresholds, starts):
+    # Avoid silent skipped cities or truncated forecast if a date is outside the 2026-2030 table.
+    wanted = [d.strftime('%Y%m%d') for d in starts]
+    missing = [(city, week) for city in indices for week in wanted if week not in thresholds[city]]
+    if missing:
+        raise ValueError(f'Soglie non disponibili per {len(missing)} località/settimane. Esempio: {missing[:5]}')
+    for city in indices:
+        for datecode in wanted:
+            rec = thresholds[city][datecode]
+            for v in ('T','P'):
+                a = np.array([rec[f'{v}_p{p}'] for p in (0,20,40,60,80,100)], dtype=float)
+                if not np.all(np.isfinite(a)) or not np.all(np.diff(a)>=0):
+                    raise ValueError(f'Soglie non valide {city} {datecode} {v}: {a}')
+
+
+def request_for(init, param):
+    # S2S temperature is a 24-hour mean field. Precipitation is cumulative from init.
+    if param=='t2m':
+        variable='2m_temperature'  # ECDS API example: 2m_temperature
+        leadtime=[f'{i}_{i+24}' for i in range(0, 1104, 24)]
+    else:
+        variable='total_precipitation'
+        leadtime=[str(i) for i in range(24, 1105, 24)]
+    return {
+        'origin': 'ecmwf', 'year': str(init.year), 'month': f'{init.month:02}',
+        'day': f'{init.day:02}', 'time': '00:00',
+        'level_type': 'single_level','variable':[variable],
+        'forecast_type':'perturbed_forecast', 'leadtime_hour':leadtime,
+        'data_format':'grib', 'area':[54,-14,28,44]
+    }
+
+
+def download_grib(init, raw_dir):
+    token=os.getenv('ECDS_API_KEY')
+    if not token:
+        raise RuntimeError('ECDS_API_KEY non configurata. Usare GitHub Secrets (o variabile ambiente).')
+    import cdsapi
+    client=cdsapi.Client(url='https://ecds.ecmwf.int/api',key=token)
+    paths={}
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    for var in ('t2m','tp'):
+        path=raw_dir / f'ecmwf_s2s_{var}_{init:%Y%m%d}.grib'
+        if not path.exists() or path.stat().st_size==0:
+            print('ECDS download', var, init.strftime('%Y%m%d'),flush=True)
+            tmp=path.with_suffix('.grib.partial')
+            if tmp.exists():tmp.unlink()
+            client.retrieve('s2s-forecasts',request_for(init,var),str(tmp))
+            if not tmp.exists() or tmp.stat().st_size < 100:
+                raise RuntimeError(f'Download ECDS vuoto: {tmp}')
+            if tmp.open('rb').read(4)!=b'GRIB':
+                raise RuntimeError(f'Non è un file GRIB: {tmp}. Controlla la risposta ECDS.')
+            tmp.replace(path)
+        print('GRIB',path,'MB=',round(path.stat().st_size/1e6,1),flush=True)
+        paths[var]=path
+    return paths
+
+
+def read_grib_da(path):
+    # Each downloaded file contains exactly one GRIB parameter.
+    ds=xr.open_dataset(path, engine='cfgrib',backend_kwargs={'indexpath':''})
+    names=list(ds.data_vars)
+    if len(names)!=1:
+        raise RuntimeError(f'{path}: attesa una variabile, ricevute {names}')
+    da=ds[names[0]]
+    ren={}
+    for src,dst in [('number','member'),('ens','member'),('latitude','latitude'),('lat','latitude'),('lon','longitude')]:
+        if src in da.dims and src!=dst:ren[src]=dst
+    if ren:da=da.rename(ren)
+    if 'member' not in da.dims or da.sizes['member']<2:
+        raise RuntimeError(f'{path}: ensemble perturbato non trovato! dims={da.dims}')
+    required=('step','latitude','longitude')
+    if not all(d in da.dims for d in required):
+        raise RuntimeError(f'{path}: dimensioni GRIB non attese {da.dims}; richieste {required}')
+    da=da.transpose('member','step','latitude','longitude')
+    if da.sizes['member'] < 10:
+        raise RuntimeError(f'{path}: soltanto {da.sizes["member"]} membri, download apparentemente incompleto')
+    # Loaded into memory so the GRIB file is not kept open while xarray operates.
+    da=da.load()
+    ds.close()
+    return da
+
+
+def step_end_hours(da):
+    a=da['step'].values
+    if np.issubdtype(a.dtype,np.timedelta64):
+        hours=(a/np.timedelta64(1,'h')).astype(float)
+    elif np.issubdtype(a.dtype,np.number):
+        hours=a.astype(float)
+    else:
+        raise ValueError(f'Tipo step inaspettato: {a.dtype}')
+    if not np.all(np.isclose(hours, np.round(hours))):
+        raise ValueError(f'Step non interi in ore: {hours}')
+    return np.round(hours).astype(int)
+
+
+def normalize_da(da, init, var):
+    hours=step_end_hours(da)
+    expected=np.arange(24,1105,24,dtype=int)
+    if len(hours)!=len(expected) or not np.array_equal(hours,expected):
+        raise RuntimeError(f'{var}: step incompleti/errati, trovati {len(hours)}: {hours.tolist()}')
+    data=da.astype('float32')
+    units=str(da.attrs.get('units','')).strip().lower().replace(' ','')
+    if var=='t2m':
+        if units not in ('k','kelvin'):
+            raise ValueError(f'Temperatura con unità non riconosciute: {da.attrs.get("units")}')
+        data=data-273.15
+    else:
+        # These values are cumulative from initialization. Each 24-hour amount is a difference.
+        # S2S uses kg m-2, numerically equivalent to millimetres; some ecCodes releases may expose m.
+        if units in ('kgm**-2','kgm-2','kg/m2','kg/m^2','mm'):
+            factor=1.0
+        elif units in ('m','metre','meter'):
+            factor=1000.0
+        else:
+            raise ValueError(f'Unità precipitazione GRIB sconosciute: {da.attrs.get("units")}')
+        data=data*factor
+        # keep the true first accumulation [0,24] and then consecutive increments
+        diff=xr.concat([data.isel(step=slice(0,1)), data.diff('step')],dim='step')
+        diff=diff.assign_coords(step=data['step'])
+        minimum=float(diff.min())
+        if minimum < -0.1:
+            raise ValueError(f'Precipitazione cumulata in diminuzione: minimo incremento {minimum:.3f} mm')
+        data=diff.clip(min=0.0)
+    # Each field for step ending 24,48,... is assigned to its interval START at 00 UTC.
+    data=data.assign_coords(day=('step', [np.datetime64((init+timedelta(hours=int(h)-24)).replace(tzinfo=None)) for h in hours]))
+    data=data.swap_dims({'step':'day'}).drop_vars('step',errors='ignore')
+    return data.rename(var)
+
+
+def weekly_interpolated(da, starts, var):
+    weeks=[]
+    for start in starts:
+        days=np.array([(start+timedelta(days=i)).replace(tzinfo=None) for i in range(7)],dtype='datetime64[ns]')
+        chunk=da.sel(day=days)
+        if chunk.sizes['day'] != 7:
+            raise RuntimeError(f'{var}: settimana {start:%Y%m%d} incompleta')
+        agg=chunk.mean('day') if var=='t2m' else chunk.sum('day')
+        weeks.append(agg)
+    result=xr.concat(weeks,dim='week').assign_coords(week=np.arange(1,6))
+    result=result.interp(latitude=LATS,longitude=LONS,method='linear',assume_sorted=False).astype('float32')
+    if not np.all(np.isfinite(result.values)):
+        raise ValueError(f'{var}: valori NaN dopo interpolazione 0.4°. Verificare area ECDS.')
+    return result.transpose('week','member','latitude','longitude')
+
+
+def quintile_probs(fc, bounds):
+    """fc: (members, lat, lon) or (members,), bounds: (4, lat,lon) or (4,).
+       Outputs: (5,lat,lon) or (5,); equality goes to the lower quintile.
+    """
+    fc=np.asarray(fc)
+    bounds=np.asarray(bounds)
+    if fc.ndim==1:
+        classes=np.sum(fc[:,None]>bounds[None,:],axis=1)
+    else:
+        classes=np.sum(fc[:,None,:,:]>bounds[None,:,:,:],axis=1)
+    return np.stack([100.0*np.mean(classes==k,axis=0) for k in range(5)],axis=0).astype('float32')
+
+
+def rounded_proba(vals):
+    a=np.asarray(vals,dtype=float)
+    r=np.round(a,2)
+    r[-1]=np.round(100-r[:-1].sum(),2)
+    return r.tolist()
+
+
+def city_probabilities(tweek,pweek, indices, thresholds, starts):
+    """Uses EACH city's OWN climatological percentiles without interpolation."""
+    out={}
+    for city,(row,col) in indices.items():
+        perweek={}
+        for n,start in enumerate(starts[:4]):
+            key=start.strftime('%Y%m%d')
+            record=thresholds[city][key]
+            arrs={}
+            for name,weather,kind in [('T',tweek,'T'),('P',pweek,'P')]:
+                series=weather.isel(week=n,latitude=row,longitude=col).values
+                bounds=np.array([record[f'{kind}_p{k}'] for k in QUANTILES])
+                probs=quintile_probs(series,bounds)
+                arrs.update({f'{name}_{k+1}':v for k,v in enumerate(rounded_proba(probs))})
+            perweek[key]=arrs
+        out[city]=perweek
+    return out
+
+
+class ApproximateMapThresholds:
+    """Interpolate climatology *between city points* to build map-only approximations.
+       Not a substitute for gridded ERA5 climatology. Duplicate locations are averaged.
+    """
+    def __init__(self,indices):
+        groups={}
+        for city,(row,col) in indices.items():
+            groups.setdefault((row,col),[]).append(city)
+        self.groups=groups
+        self.points=np.array([[LONS[j],LATS[i]] for i,j in groups],dtype=float)
+        self.lon2d,self.lat2d=np.meshgrid(LONS,LATS)
+        self.tri=Delaunay(self.points)
+    def bounds(self, city_thresholds, start, kind):
+        key=start.strftime('%Y%m%d')
+        source=np.array([[np.mean([city_thresholds[city][key][f'{kind}_p{q}'] for city in cities]) for q in QUANTILES] for cities in self.groups.values()],dtype=float)
+        linear=LinearNDInterpolator(self.tri,source,fill_value=np.nan)(self.lon2d,self.lat2d)
+        if np.isnan(linear).any():
+            nearest=NearestNDInterpolator(self.points,source)(self.lon2d,self.lat2d)
+            linear=np.where(np.isnan(linear),nearest,linear)
+        bounds=np.maximum.accumulate(linear,axis=-1)
+        return np.moveaxis(bounds,-1,0) # (4,lat,lon)
+
+
+def build_map_probabilities(tweek,pweek, thresholds, indices, starts):
+    interpolator=ApproximateMapThresholds(indices)
+    for n,start in enumerate(starts):
+        t_bounds=interpolator.bounds(thresholds,start,'T')
+        p_bounds=interpolator.bounds(thresholds,start,'P')
+        tprob=quintile_probs(tweek.isel(week=n).values,t_bounds)
+        pprob=quintile_probs(pweek.isel(week=n).values,p_bounds)
+        # layout exactly as plot_terciles_week() in original Leonardo script:
+        # first 5 quintiles, positions 10..12 sum of Q1+Q2, Q3, Q4+Q5.
+        arrays={}
+        for field, probs in [('2tp',tprob),('tpp',pprob)]:
+            arr=np.full((13,*GRID_SHAPE),np.nan,dtype=np.float32)
+            arr[:5]=probs
+            arr[10]=probs[0]+probs[1]
+            arr[11]=probs[2]
+            arr[12]=probs[3]+probs[4]
+            arrays[field]=arr
+        yield n,start,arrays,interpolator.lat2d,interpolator.lon2d
+
+
+def write_probability_netcdf(tweek,pweek, indices, thresholds, starts, target):
+    # Save actual model members as separate NetCDF for reproducibility / future ERA5 calibration.
+    ds=xr.Dataset({'t2m':tweek,'tp':pweek})
+    ds=ds.assign_coords(week_start=('week', [np.datetime64(t.replace(tzinfo=None)) for t in starts]))
+    ds['t2m'].attrs['units']='degC';ds['tp'].attrs['units']='mm'
+    ds.attrs['interpolation']='bilinear from ECDS S2S 1.5 degree to 0.4 degree'
+    try:
+        import h5netcdf  # noqa: F401
+        ds.to_netcdf(target, engine='h5netcdf',encoding={k:{'compression':'gzip','compression_opts':3} for k in ('t2m','tp')})
+    except ModuleNotFoundError:
+        print('WARNING: h5netcdf non presente: NetCDF3 non compresso (solo fallback locale)')
+        ds.to_netcdf(target, engine='scipy')
+
+
+def render_histograms(city_json,thresholds,init,folder):
+    from plotting import plot_city_combined
+    folder.mkdir(exist_ok=True,parents=True)
+    for city, weeks in city_json.items():
+        starts=sorted(weeks.keys())
+        out=folder / f'{city}_{starts[0]}.webp'
+        plot_city_combined(city,starts,weeks,thresholds[city],str(out),init.strftime('%d/%m/%Y'))
+    print(f'Grafici località prodotti: {len(city_json)}',flush=True)
+
+
+def render_maps(tweek,pweek,indices,thresholds,starts,init,folder):
+    import plotting
+    plotting.TARGET_DATE=init.replace(tzinfo=None)
+    folder.mkdir(exist_ok=True,parents=True)
+    for n,start,arrays,lat2d,lon2d in build_map_probabilities(tweek,pweek,thresholds,indices,starts):
+        # Legacy plot infers start by reading final four chars prior to ____, end-exclusive.
+        end_exclusive=start+timedelta(days=7)
+        key=f'S2F{init:%m%d}{end_exclusive:%m%d}____ECDS'
+        for v in ('2tp','tpp'):
+            print('Plot',start.strftime('%Y%m%d'),v,flush=True)
+            plotting.plot_terciles_week(key,arrays[v],v,str(folder),lat2d,lon2d)
+
+
+def main(argv=None):
+    cli=argparse.ArgumentParser(description=__doc__)
+    cli.add_argument('--date',help='Data emissione ECMWF (YYYY-MM-DD, lunedì o giovedì); omesso = automatica')
+    cli.add_argument('--output',default='output',help='Directory degli output')
+    cli.add_argument('--grib-dir', help='GRIB già scaricati; salta richiesta ECDS')
+    cli.add_argument('--no-maps',action='store_true',help='Salta mappe Cartopy (test rapidi)')
+    cli.add_argument('--no-plots',action='store_true',help='Salta tutti i plot, crea solo JSON/NetCDF')
+    cli.add_argument('--dry-run',action='store_true',help='Valida asset e stampa richieste senza scaricare')
+    args=cli.parse_args(argv)
+    init=date_from_args(args.date);starts=week_starts(init)
+    indices,thresholds=load_assets()
+    check_threshold_weeks(indices,thresholds,starts)
+    print('RUN',init.strftime('%Y-%m-%d'),'Grid',GRID_SHAPE, 'Locations',len(indices),flush=True)
+    print('Weeks:',', '.join(s.strftime('%Y-%m-%d') for s in starts),flush=True)
+    if args.dry_run:
+        print(json.dumps({p:request_for(init,p) for p in ('t2m','tp')},indent=2));return
+    output=Path(args.output).resolve()/init.strftime('%Y%m%d')
+    output.mkdir(parents=True,exist_ok=True)
+    if args.grib_dir:
+        raw=Path(args.grib_dir).resolve()
+        paths={v:raw/f'ecmwf_s2s_{v}_{init:%Y%m%d}.grib' for v in ('t2m','tp')}
+        for p in paths.values():
+            if not p.exists():raise FileNotFoundError(p)
+    else:
+        paths=download_grib(init,output/'grib')
+    t=normalize_da(read_grib_da(paths['t2m']),init,'t2m')
+    p=normalize_da(read_grib_da(paths['tp']),init,'tp')
+    if not np.array_equal(t['member'].values,p['member'].values):
+        raise RuntimeError('Membri temperatura e precipitazione non allineati')
+    tw=weekly_interpolated(t,starts,'t2m')
+    pw=weekly_interpolated(p,starts,'tp')
+    del t,p
+    write_probability_netcdf(tw,pw,indices,thresholds,starts,output/'ensemble_settimanale_04.nc')
+    city_data=city_probabilities(tw,pw,indices,thresholds,starts)
+    json_path=output/f'province_quintili_{init:%Y_%m_%d}.json'
+    json_path.write_text(json.dumps(city_data,indent=2,ensure_ascii=False),encoding='utf-8')
+    print('JSON',json_path,flush=True)
+    if not args.no_plots:
+        render_histograms(city_data,thresholds,init,output/'PLOT_istogrammi')
+        if not args.no_maps:render_maps(tw,pw,indices,thresholds,starts,init,output/'PLOT')
+    (output/'METODOLOGIA.txt').write_text('''S2S real-time ECMWF, ensemble perturbato, 0.4 degree bilinear interpolation.\nTemperature: daily mean 24h, weekly average in degC.\nPrecipitation: 24h difference between cumulative from init, weekly sum in mm.\nProvince plots: probability thresholds from per-city soglie_settimanali_med.\nRegional maps: thresholds linearly interpolated from station/province reference points\nand nearest-neighbour extrapolation beyond hull; these are APPROXIMATE, not ERA5 gridded.\nMap 3-category colors use the original 40/20/40 reshaped scheme, not true terciles.\nNO downscaling or model-bias correction.\n''')
+    print('DONE', output,flush=True)
+
+if __name__=='__main__': main()
