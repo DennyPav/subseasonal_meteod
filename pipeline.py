@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MeteoD S2S 0.4°: ECDS ECMWF -> ensemble weekly -> PNG -> Cloudflare R2.
+"""MeteoD S2S 0.4°: ECDS ECMWF -> ensemble weekly -> WebP -> Cloudflare R2.
 
 IMPORTANT: spatially interpolated city thresholds used for maps are an APPROXIMATION,
 not a gridded ERA5 climatology. City histograms use the ORIGINAL per-city thresholds.
@@ -329,7 +329,7 @@ def render_histograms(city_json,thresholds,init,folder):
     folder.mkdir(exist_ok=True,parents=True)
     for city, weeks in city_json.items():
         starts=sorted(weeks.keys())
-        out=folder / f'{city}_{starts[0]}.png'
+        out=folder / f'{city}_{starts[0]}.webp'
         plot_city_combined(city,starts,weeks,thresholds[city],str(out),init.strftime('%d/%m/%Y'))
     print(f'Grafici località prodotti: {len(city_json)}',flush=True)
 
@@ -356,8 +356,8 @@ def validate_r2_config():
                            '. Configurarle nei GitHub Actions Secrets.')
 
 
-def upload_pngs_to_r2(image_dir, expected_count, client=None):
-    """Publish *only* PNG images to the original `settimanali` bucket root.
+def upload_webps_to_r2(image_dir, expected_count, client=None):
+    """Publish *only* WebP images to the original `settimanali` bucket root.
 
     The previous Leonardo workflow used `upload_file(..., bucket, filename)`;
     the object key was the bare filename, NOT a prefix such as `PLOT/`.
@@ -365,14 +365,14 @@ def upload_pngs_to_r2(image_dir, expected_count, client=None):
     """
     from pathlib import Path
     image_dir = Path(image_dir)
-    images = sorted(image_dir.rglob('*.png'))
+    images = sorted(image_dir.rglob('*.webp'))
     if len(images) != expected_count:
-        raise RuntimeError(f'PNG prodotti: {len(images)}, attesi: {expected_count}. Upload annullato.')
+        raise RuntimeError(f'WebP prodotti: {len(images)}, attesi: {expected_count}. Upload annullato.')
     names = [p.name for p in images]
     if len(set(names)) != len(names):
-        raise RuntimeError('Nomi PNG duplicati fra mappe e località: upload annullato.')
+        raise RuntimeError('Nomi WebP duplicati fra mappe e località: upload annullato.')
     if any(p.stat().st_size < 100 for p in images):
-        raise RuntimeError('PNG vuoti o incompleti: upload annullato.')
+        raise RuntimeError('WebP vuoti o incompleti: upload annullato.')
     validate_r2_config()
 
     bucket = os.getenv('R2_BUCKET', 'settimanali').strip()
@@ -389,24 +389,46 @@ def upload_pngs_to_r2(image_dir, expected_count, client=None):
             region_name='auto',
             config=Config(retries={'max_attempts': 5, 'mode': 'standard'}),
         )
-    extra = {'ContentType': 'image/png', 'CacheControl': 'public, max-age=300'}
-    print(f'UPLOAD R2: {len(images)} PNG nel bucket {bucket}, prefix={prefix or "(radice)"}', flush=True)
+    extra = {'ContentType': 'image/webp', 'CacheControl': 'public, max-age=300'}
+    print(f'UPLOAD R2: {len(images)} WebP nel bucket {bucket}, prefix={prefix or "(radice)"}', flush=True)
+    objects = []
     for i, path in enumerate(images, 1):
         key = f'{prefix}/{path.name}' if prefix else path.name
         # Exceptions must propagate: GitHub must report a failed upload.
         client.upload_file(str(path), bucket, key, ExtraArgs=extra)
+        objects.append((key, path.stat().st_size))
         if i % 20 == 0 or i == len(images):
-            print(f'Caricati {i}/{len(images)} PNG', flush=True)
+            print(f'Caricati {i}/{len(images)} WebP', flush=True)
+
+    # Optional remote verification: a successful boto3 upload_file() normally
+    # confirms completion, but HEAD provides an independent size check before
+    # the GitHub action exits successfully.
+    if os.environ.get('R2_VERIFY_OBJECTS', '').lower() in ('1', 'true', 'yes'):
+        from concurrent.futures import ThreadPoolExecutor
+
+        def verify_object(entry):
+            key, size = entry
+            response = client.head_object(Bucket=bucket, Key=key)
+            remote_size = int(response['ContentLength'])
+            if remote_size != size:
+                raise RuntimeError(
+                    f'Upload R2 non verificato per {key}: locale={size} B, remoto={remote_size} B'
+                )
+            return key
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            confirmed = list(executor.map(verify_object, objects))
+        print(f'Verifica R2 completata: {len(confirmed)}/{len(objects)} oggetti presenti con dimensione corretta', flush=True)
     return len(images)
 
 
 def main(argv=None):
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument('--date', help='Emissione ECMWF YYYY-MM-DD; omesso = oggi UTC meno 2 giorni')
-    cli.add_argument('--output', default='output', help='Directory locale per i SOLI PNG')
+    cli.add_argument('--output', default='output', help='Directory locale per i SOLI WebP')
     cli.add_argument('--grib-dir', help='GRIB precedentemente scaricati; evita la richiesta ECDS')
     cli.add_argument('--no-maps', action='store_true', help='Genera soltanto gli istogrammi provinciali')
-    cli.add_argument('--no-upload', action='store_true', help='Genera PNG senza inviarli a Cloudflare (prove locali)')
+    cli.add_argument('--no-upload', action='store_true', help='Genera WebP senza inviarli a Cloudflare (prove locali)')
     cli.add_argument('--dry-run', action='store_true', help='Valida asset e stampa richieste senza scaricare o caricare')
     args = cli.parse_args(argv)
     init = date_from_args(args.date)
@@ -422,7 +444,7 @@ def main(argv=None):
     if not args.no_upload:
         validate_r2_config()  # fail early if secrets are missing
 
-    # The only persistent products are PNG. Raw GRIB are downloaded to a
+    # The only persistent products are WebP. Raw GRIB are downloaded to a
     # TemporaryDirectory and deleted automatically even when processing fails.
     image_dir = Path(args.output).resolve() / init.strftime('%Y%m%d')
     image_dir.mkdir(parents=True, exist_ok=True)
@@ -448,13 +470,13 @@ def main(argv=None):
             render_maps(tw, pw, indices, thresholds, starts, init, image_dir / 'mappe')
     expected = len(indices) + (0 if args.no_maps else 2 * len(starts))
     if args.no_upload:
-        pngs = list(image_dir.rglob('*.png'))
-        if len(pngs) != expected:
-            raise RuntimeError(f'PNG generati: {len(pngs)}; attesi: {expected}')
-        print(f'DONE (senza upload): {len(pngs)} PNG in {image_dir}', flush=True)
+        webps = list(image_dir.rglob('*.webp'))
+        if len(webps) != expected:
+            raise RuntimeError(f'WebP generati: {len(webps)}; attesi: {expected}')
+        print(f'DONE (senza upload): {len(webps)} WebP in {image_dir}', flush=True)
     else:
-        upload_pngs_to_r2(image_dir, expected)
-        print(f'DONE: {expected} PNG caricati su R2', flush=True)
+        upload_webps_to_r2(image_dir, expected)
+        print(f'DONE: {expected} WebP caricati su R2', flush=True)
 
 
 if __name__ == '__main__':

@@ -282,13 +282,13 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
     fig.patches.append(legend_border)
 
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"subseasonal_{start_date.strftime('%Y%m%d')}_{varname}.png"
+    filename = f"subseasonal_{start_date.strftime('%Y%m%d')}_{varname}.webp"
     plt.savefig(
         os.path.join(output_dir, filename),
-        format="png",
+        format="webp",
         dpi=150,
         bbox_inches="tight",
-        pil_kwargs={"optimize": True}
+        pil_kwargs={"quality": 70}
     )
     plt.close(fig)
 
@@ -437,6 +437,6 @@ def plot_city_combined(city, weeks, q_data, s_data, out_path, run_date):
                bbox_to_anchor=(0.75, -0.05), ncol=1, fontsize=9)
 
     plt.subplots_adjust(bottom=0.15, top=0.88)
-    plt.savefig(out_path, format="png", dpi=100, bbox_inches="tight", pad_inches=0.1,
-                pil_kwargs={"optimize": True})
+    plt.savefig(out_path, format="webp", dpi=150, bbox_inches="tight",
+                pil_kwargs={"quality": 70})
     plt.close(fig)
