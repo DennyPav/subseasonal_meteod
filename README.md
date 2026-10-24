@@ -1,4 +1,4 @@
-# MeteoD - Settimanali ECMWF S2S, v1 (senza Leonardo)
+# MeteoD - Settimanali ECMWF S2S, v2 (senza Leonardo)
 
 ## Cosa fa
 1. Scarica **temperature medie giornaliere** e **precipitazioni cumulative** dell'**ensemble perturbato ECMWF S2S** dal portale **ECDS** (dataset `s2s-forecasts`).
@@ -24,10 +24,10 @@ Non vengono effettuati downscaling statistico, correzione bias o calibrazione su
 2. Accedi a https://ecds.ecmwf.int/datasets/s2s-forecasts?tab=download e **accetta le condizioni/licenze** del dataset.
 3. Vai su https://ecds.ecmwf.int/how-to-api e recupera il tuo token personale ECMWF.
 4. Su GitHub vai in **Settings → Secrets and variables → Actions → New repository secret** e crea `ECDS_API_KEY` con quel token. **Non** inserirlo negli script.
-5. Vai in **Actions → MeteoD ECMWF S2S Settimanali → Run workflow**. Inserisci `2026-10-22` nel campo `run_date` per la prima prova (giovedì; accessibile una volta trascorsa la latenza ECDS). Se lasci vuoto, viene calcolata l'ultima run di lunedì/giovedì vecchia di almeno 60 ore.
+5. Vai in **Actions → MeteoD ECMWF S2S Settimanali → Run workflow**. Per la prima prova lascia il campo `run_date` **vuoto**. Verrà selezionata automaticamente la data UTC di **due giorni prima**, indipendentemente dal giorno della settimana. Per un test storico puoi inserire ad esempio `2026-10-22`.
 6. Verifica i log. Nel riepilogo della run scarica l'artifact `meteod-s2s-output-N`, con WebP, JSON e NetCDF.
 
-È presente anche una pianificazione per **domenica e giovedì alle 14:00 UTC**, per concedere all'archivio un tempo sufficiente dopo le run di lunedì/giovedì. Nessun upload su Cloudflare R2 per questa **prima versione di validazione**.
+È presente una pianificazione **tutti i giorni alle 12:15 UTC**, che richiede la run ECMWF S2S delle 00 UTC di due giorni prima (circa 60 ore dopo l'inizializzazione). ECMWF S2S è giornaliero dall'aggiornamento di novembre 2024. Nessun upload su Cloudflare R2 per questa **prima versione di validazione**.
 
 ### Esecuzione locale
 
@@ -36,7 +36,9 @@ Richiede Python 3.11/3.12, librerie in `requirements.txt` ed ecCodes per cfgrib.
 ```bash
 pip install -r requirements.txt
 export ECDS_API_KEY='IL_TUO_TOKEN'
-python pipeline.py --date 2026-10-22 --dry-run
+python pipeline.py --dry-run
+python pipeline.py --output output
+# Per una emissione storica specifica:
 python pipeline.py --date 2026-10-22 --output output
 ```
 
@@ -70,10 +72,18 @@ python tests/test_offline.py
 
 È un test offline con 12 membri sintetici, nessuna chiamata ECMWF. Verifica differenza delle precipitazioni cumulative, griglia, interpolazione, cinque quintili, tutte le località, struttura delle mappe, NetCDF e un istogramma WebP. Il download reale ECDS, i GRIB scaricati e le mappe Cartopy complete **devono ancora essere verificati alla prima esecuzione Actions**.
 
+### Modifiche v2: data giornaliera e errore MARS `Ambiguous`
+
+* Se non viene passato `--date`, la pipeline usa la data **UTC di due giorni prima**; dal 12 novembre 2024 ECMWF S2S è giornaliero, non solo lunedì e giovedì.
+* La richiesta ECDS viene costruita nel formato **MARS-like** con codici numerici: `class=27` (S2S), `param=167` (temperatura 2 m), `param=228` (precipitazione totale). Questo evita di inviare i nomi descrittivi ambigui che sono comparsi nel log `MarsRuntimeError`.
+* Dopo il download tutte le altre funzioni della v1 (interpolazione 0,4°, province, soglie, mappe e istogrammi) rimangono inalterate.
+* **Importante**: i codici sono quelli ufficiali ECMWF, ma non è stato possibile provare dal vivo che il backend ECDS accetti `class=27` nella sintassi MARS-like. Se si riceve un errore diverso (ad es. class non valida), il log della prima esecuzione sarà necessario per adeguare la richiesta. Non attribuire eventuali errori di sintassi alla mancanza dei dati.
+* Il ritardo di 48 ore è un vincolo minimo, **non una garanzia di pubblicazione** a un preciso minuto. Se il file richiesto non è stato ancora archiviato, il job fallisce e non utilizza silenziosamente una data precedente.
+
 ### Errori comuni
 
 - `403` o problemi di autorizzazione: accetta la licenza ECDS con l'account associato al token.
-- `Variable request not found`: controlla il nome `2m_temperature` con lo snippet 'Show API request code' dell'ECDS per `s2s-forecasts`; la nomenclatura può cambiare.
+- `MarsRuntimeError`/`Ambiguous`: nella v2 i nomi ambigui sono stati sostituiti da codici numerici. Se persiste, confrontare i log con la richiesta MARS-like generata dal portale ECDS.
 - `Step incompleti`: il forecast ottenuto non contiene gli intervalli 24h previsti; non proseguire con aggregazioni parziali.
 - `Precipitazione cumulata in diminuzione`: fermarsi e controllare i metadati del GRIB, nessuna conversione automatica cieca.
 - `Soglie non disponibili`: il file contiene solo settimane **2026–2030**. Nuove date richiedono l'aggiornamento della climatologia di riferimento.

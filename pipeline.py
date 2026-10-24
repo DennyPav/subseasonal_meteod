@@ -25,16 +25,21 @@ GRID_SHAPE = (len(LATS), len(LONS))
 QUANTILES = (20, 40, 60, 80)
 
 
-def date_from_args(value=None, max_age_hours=60):
+def date_from_args(value=None, now=None):
+    """Default to the latest 00 UTC ECMWF S2S date permitted by the 48h ECDS delay.
+
+    ECMWF S2S runs DAILY since the 2024 model upgrade: do NOT force Mon/Thu.
+    The schedule is at 12 UTC, so the cycle at (today - 2 days) 00 UTC
+    has already aged at least 60 hours when requested.
+    """
     if value:
-        d = datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
-        if d.weekday() not in (0, 3):
-            raise ValueError('Le emissioni ECMWF S2S previste sono lunedì e giovedì: scegli una di queste date')
-        return d
-    d = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-    while d.weekday() not in (0, 3):
-        d -= timedelta(days=1)
-    return d.replace(hour=0, minute=0, second=0, microsecond=0)
+        return datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError('La data/ora di riferimento deve includere il fuso orario')
+    return (now.astimezone(timezone.utc) - timedelta(days=2)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
 
 
 def week_starts(init):
@@ -71,19 +76,35 @@ def check_threshold_weeks(indices, thresholds, starts):
 
 
 def request_for(init, param):
-    # S2S temperature is a 24-hour mean field. Precipitation is cumulative from init.
-    if param=='t2m':
-        variable='2m_temperature'  # ECDS API example: 2m_temperature
-        leadtime=[f'{i}_{i+24}' for i in range(0, 1104, 24)]
+    """ECDS S2S with explicit numerical MARS codes to avoid name ambiguity.
+
+    MARS codes: class 27 = S2S (s2), 167 = 2 m temperature, 228 = total
+    precipitation. Explicit codes avoid the source error in which the ECDS->MARS
+    translation used ambiguous strings `s2` and `2m_temperature`.
+
+    Temperature: each period [0-24], [24-48], ... is a daily average.
+    Precipitation: use the 24h endpoints of accumulated-from-0 6h fields.
+    """
+    if param == 't2m':
+        param_code = '167'
+        steps = [f'{i}-{i+24}' for i in range(0, 1104, 24)]
+    elif param == 'tp':
+        param_code = '228'
+        steps = [str(i) for i in range(24, 1105, 24)]
     else:
-        variable='total_precipitation'
-        leadtime=[str(i) for i in range(24, 1105, 24)]
+        raise ValueError(f'Parametro non previsto: {param}')
     return {
-        'origin': 'ecmwf', 'year': str(init.year), 'month': f'{init.month:02}',
-        'day': f'{init.day:02}', 'time': '00:00',
-        'level_type': 'single_level','variable':[variable],
-        'forecast_type':'perturbed_forecast', 'leadtime_hour':leadtime,
-        'data_format':'grib', 'area':[54,-14,28,44]
+        'class': '27',      # numerical GRIB MARS class code, S2S (abbreviation s2)
+        'expver': 'prod',
+        'stream': 'enfo',
+        'type': 'pf',
+        'origin': 'ecmf',
+        'levtype': 'sfc',
+        'date': init.strftime('%Y-%m-%d'),
+        'time': '00:00:00',
+        'param': param_code,
+        'step': steps,
+        'area': '54/-14/28/44',
     }
 
 
@@ -321,7 +342,7 @@ def render_maps(tweek,pweek,indices,thresholds,starts,init,folder):
 
 def main(argv=None):
     cli=argparse.ArgumentParser(description=__doc__)
-    cli.add_argument('--date',help='Data emissione ECMWF (YYYY-MM-DD, lunedì o giovedì); omesso = automatica')
+    cli.add_argument('--date',help='Emissione ECMWF (YYYY-MM-DD, qualunque giorno); omesso = oggi UTC meno 2 giorni')
     cli.add_argument('--output',default='output',help='Directory degli output')
     cli.add_argument('--grib-dir', help='GRIB già scaricati; salta richiesta ECDS')
     cli.add_argument('--no-maps',action='store_true',help='Salta mappe Cartopy (test rapidi)')
@@ -331,7 +352,7 @@ def main(argv=None):
     init=date_from_args(args.date);starts=week_starts(init)
     indices,thresholds=load_assets()
     check_threshold_weeks(indices,thresholds,starts)
-    print('RUN',init.strftime('%Y-%m-%d'),'Grid',GRID_SHAPE, 'Locations',len(indices),flush=True)
+    print('RUN ECMWF S2S UTC',init.strftime('%Y-%m-%d'),'Grid',GRID_SHAPE, 'Locations',len(indices),flush=True)
     print('Weeks:',', '.join(s.strftime('%Y-%m-%d') for s in starts),flush=True)
     if args.dry_run:
         print(json.dumps({p:request_for(init,p) for p in ('t2m','tp')},indent=2));return
