@@ -1,55 +1,58 @@
-name: MeteoD ECMWF S2S Settimanali
+name: MeteoD ECMWF S2S → Cloudflare R2
 
 on:
+  schedule:
+    # Ogni giorno alle 12:15 UTC: run ECMWF delle 00 UTC di 2 giorni prima
+    - cron: '15 12 * * *'
   workflow_dispatch:
     inputs:
       run_date:
-        description: 'Emissione ECMWF YYYY-MM-DD; vuoto = data UTC odierna meno 2 giorni'
+        description: 'Emissione YYYY-MM-DD (vuoto = 2 giorni fa UTC)'
         required: false
         type: string
-  schedule:
-    # Ogni giorno alle 12:15 UTC: chiede la run delle 00 UTC di due giorni prima.
-    - cron: '15 12 * * *'
 
 permissions:
   contents: read
 
 concurrency:
-  group: meteod-s2s
+  group: meteod-subseasonal
   cancel-in-progress: false
 
 jobs:
-  create-plots:
+  create-and-publish-png:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
       ECDS_API_KEY: ${{ secrets.ECDS_API_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: settimanali
+      # NESSUNA sottocartella: come nel vecchio script Leonardo
+      R2_PREFIX: ''
+      RUN_DATE: ${{ inputs.run_date }}
       PYTHONUNBUFFERED: '1'
       MPLBACKEND: Agg
-      RUN_DATE: ${{ inputs.run_date }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-      - name: Install ecCodes and Python dependencies
+      - name: Install Python and GRIB libraries
         run: |
           sudo apt-get update
           sudo apt-get install -y libeccodes0 libeccodes-dev
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
-      - name: Test numerici offline
+      - name: Test offline
         run: python tests/test_offline.py
-      - name: Validate input assets
-        run: python pipeline.py --date "$RUN_DATE" --dry-run
-      - name: ECDS -> probabilities -> plots
-        run: python pipeline.py --date "$RUN_DATE" --output output
-      - name: Upload outputs for review
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: meteod-s2s-output-${{ github.run_number }}
-          path: output/
-          retention-days: 7
-          if-no-files-found: warn
+      - name: ECDS API -> quintili -> PNG -> Cloudflare R2
+        run: |
+          if [ -n "$RUN_DATE" ]; then
+            python pipeline.py --date "$RUN_DATE" --output output
+          else
+            python pipeline.py --output output
+          fi
