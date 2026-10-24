@@ -75,15 +75,24 @@ def add_colored_hatching(ax_, mask, lon2d_, lat2d_, color_):
         coll.set_linewidth(0.15)
 
 def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
+    """
+    Crea e salva un plot delle probabilità del tercile più probabile per una settimana.
+    Replica il layout del flusso originario Leonardo.
+    """
+    # 3 tercili (indici 10:13)
     tercile_data = array[10:13, :, :].copy()
+    # Pesa il tercile centrale
     tercile_data[1, :, :] *= 2
 
+    # Normalizzazione a 100
     sum_terciles = np.sum(tercile_data, axis=0)
     sum_terciles[sum_terciles == 0] = 1
     tercile_data = tercile_data / sum_terciles * 100
 
+    # Dominante e valore
     max_idx = np.argmax(tercile_data, axis=0)
 
+    # Mappa colori discreti
     color_map = np.full(max_idx.shape, "#ffffff", dtype=object)
     for i in range(max_idx.shape[0]):
         for j in range(max_idx.shape[1]):
@@ -94,6 +103,7 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
     fig = plt.figure(figsize=(12, 8))
     gs = gridspec.GridSpec(2, 1, height_ratios=[0.9, 0.3], hspace=0.05)
 
+    # Mappa
     map_gs = gridspec.GridSpecFromSubplotSpec(1, 1, subplot_spec=gs[0])
     ax = fig.add_subplot(map_gs[0], projection=ccrs.PlateCarree())
 
@@ -101,26 +111,29 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
     ax.coastlines(resolution="10m", linewidth=0.5)
     ax.add_feature(cfeature.BORDERS, linewidth=0.8)
 
-    gl = ax.gridlines(draw_labels=True, linestyle="--", linewidth=0.5, color="gray")
-    gl.top_labels = False
-    gl.right_labels = False
+    gl = ax.gridlines(draw_labels=True, linestyle='--', linewidth=0.5, color='gray')
     gl.xlocator = mticker.FixedLocator(range(-180, 181, 10))
     gl.ylocator = mticker.FixedLocator(range(-90, 91, 5))
 
     rgba_map = np.array([[to_rgba(c) for c in row] for row in color_map])
-
     ax.imshow(
         rgba_map,
-        origin="upper",
+        origin='upper',
         extent=(lon2d.min(), lon2d.max(), lat2d.min(), lat2d.max()),
         transform=ccrs.PlateCarree()
     )
 
-    p10 = array[0, :, :]
-    p90 = array[4, :, :]
+    # Percentili estremi (quintili 1 e 5 preparati a monte)
+    p10 = array[0, ::-1, :]
+    p90 = array[4, ::-1, :]
 
-    thresh_10 = 80
-    thresh_90 = 80
+    # Soglie
+    if varname == "2tp":
+        thresh_10 = 80
+        thresh_90 = 80
+    else:
+        thresh_10 = 80
+        thresh_90 = 80
 
     mask_10 = p10 >= thresh_10
     mask_90 = p90 >= thresh_90
@@ -136,24 +149,18 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
         color_10 = "#a30021"
         color_90 = "#009300"
 
-    ax.contour(
-        lon2d, lat2d, contour_10,
-        levels=levels, colors=color_10,
-        linewidths=0.5,
-        transform=ccrs.PlateCarree()
-    )
-    ax.contour(
-        lon2d, lat2d, contour_90,
-        levels=levels, colors=color_90,
-        linewidths=0.5,
-        transform=ccrs.PlateCarree()
-    )
+    ax.contour(lon2d, lat2d, contour_10, levels=levels, colors=color_10,
+               linewidths=0.5, transform=ccrs.PlateCarree())
+    ax.contour(lon2d, lat2d, contour_90, levels=levels, colors=color_90,
+               linewidths=0.5, transform=ccrs.PlateCarree())
 
     add_colored_hatching(ax, contour_10, lon2d, lat2d, color_10)
     add_colored_hatching(ax, contour_90, lon2d, lat2d, color_90)
 
+    # Titolo
     try:
-        ref = globals().get("TARGET_DATE", datetime.today())
+        # helper per inferire l'anno corretto per mmdd, basandosi su una data di riferimento
+        ref = globals().get("target_date", globals().get("TARGET_DATE", datetime.today()))
 
         datecode = week_key.split("____")[0][-4:]
         temp_date = infer_year_from_mmdd(datecode, ref)
@@ -168,17 +175,13 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
         subtitle = f"{subtitle_date} {run_info}"
     except Exception:
         subtitle = ""
-        start_date = datetime.today()
 
-    main_title_text = (
-        "Weekly Anomaly Probability - Temperature 2m"
-        if varname == "2tp"
-        else "Weekly Anomaly Probability - Total Precipitation"
-    )
-
-    full_title = r"$\bf{" + main_title_text.replace(" ", r"\ ") + r"}$" + f"\n{subtitle}"
+    main_title_text = "Weekly Anomaly Probability - Temperature 2m" if varname == "2tp" else "Weekly Anomaly Probability - Total Precipitation"
+    full_title = r"$\bf{" + main_title_text.replace(" ", r"\ ") + r"}$" + f"
+{subtitle}"
     ax.set_title(full_title, fontsize=12, loc="center", pad=10, linespacing=1.5)
 
+    # --- LEGGENDA: contenitore + subgriglia ---
     bottom_gs = gridspec.GridSpecFromSubplotSpec(1, 1, subplot_spec=gs[1])
     legend_container_ax = fig.add_subplot(bottom_gs[0])
     legend_container_ax.set_axis_off()
@@ -191,9 +194,9 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
     legend_title_ax = fig.add_subplot(legend_outer[0, :])
     legend_title_ax.text(
         0.5, 0.5, "Most likely scenario",
-        fontsize=10, fontweight="bold", ha="center", va="center"
+        fontsize=10, fontweight='bold', ha='center', va='center'
     )
-    legend_title_ax.axis("off")
+    legend_title_ax.axis('off')
 
     if varname == "2tp":
         colors_1st = ["#cce5ff", "#99ccff", "#66b2ff", "#3399ff", "#0059b3"]
@@ -213,39 +216,36 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
 
     legend_axes = [legend_title_ax]
 
+    # Colonne legenda
     for i, info in legend_cols_info.items():
         ax_col = fig.add_subplot(legend_outer[1, i])
-        patches = [
-            Patch(facecolor=c, edgecolor="k", label=f"> {p}%")
-            for c, p in zip(info["colors"], info["probs"])
-        ]
+        patches = [Patch(facecolor=c, edgecolor='k', label=f"> {p}%")
+                   for c, p in zip(info["colors"], info["probs"])]
         ax_col.legend(
             handles=patches,
-            loc="upper center",
+            loc='upper center',
             fontsize=8,
             frameon=True,
             labelspacing=0.8
         )
         ax_col.set_title(info["title"], fontsize=9)
-        ax_col.axis("off")
+        ax_col.axis('off')
         legend_axes.append(ax_col)
 
         if i == 1:
-            ax_col.text(
-                0.5, 0.18, "Extreme events",
-                ha="center", va="top",
-                fontsize=9, fontweight="bold",
-                transform=ax_col.transAxes
-            )
+            ax_col.text(0.5, 0.18, "Extreme events", ha='center', va='top',
+                        fontsize=9, fontweight='bold', transform=ax_col.transAxes)
             contour_patches = [
-                Patch(facecolor="none", edgecolor=color_10, hatch="////", label=f"20th percentile > {thresh_10}%"),
-                Patch(facecolor="none", edgecolor=color_90, hatch="////", label=f"80th percentile > {thresh_90}%"),
+                Patch(facecolor='none', edgecolor=color_10, hatch='////',
+                      label=f"20th percentile > {thresh_10}%"),
+                Patch(facecolor='none', edgecolor=color_90, hatch='////',
+                      label=f"80th percentile > {thresh_90}%"),
             ]
             inset_ax = ax_col.inset_axes([0.15, -0.40, 0.7, 0.42], transform=ax_col.transAxes)
-            inset_ax.legend(handles=contour_patches, loc="center", fontsize=8, frameon=True)
-            inset_ax.axis("off")
-            legend_axes.append(inset_ax)
+            inset_ax.legend(handles=contour_patches, loc='center', fontsize=8, frameon=True)
+            inset_ax.axis('off')
 
+    # Riduci solo la larghezza del contenitore, mantenendo il centro
     p = legend_container_ax.get_position(fig)
     target_width = 0.60
     cx = 0.5 * (p.x0 + p.x1)
@@ -253,6 +253,7 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
     new_x0 = cx - new_half_w
     legend_container_ax.set_position([new_x0, p.y0, 2 * new_half_w, p.height])
 
+    # Bounding box del contenuto legenda per disegnare il bordo
     bboxes = [ax_.get_position(fig) for ax_ in legend_axes]
     x0_raw = min(b.x0 for b in bboxes)
     y0_raw = min(b.y0 for b in bboxes)
@@ -274,15 +275,17 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
         legend_width,
         legend_height,
         linewidth=0.5,
-        edgecolor="black",
-        facecolor="none",
+        edgecolor='black',
+        facecolor='none',
         transform=fig.transFigure,
         zorder=1000
     )
     fig.patches.append(legend_border)
 
+    # Salvataggio
     os.makedirs(output_dir, exist_ok=True)
-    filename = f"subseasonal_{start_date.strftime('%Y%m%d')}_{varname}.webp"
+    safe_start = locals().get("start_date", datetime.today())
+    filename = f"subseasonal_{safe_start.strftime('%Y%m%d')}_{varname}.webp"
     plt.savefig(
         os.path.join(output_dir, filename),
         format="webp",

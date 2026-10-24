@@ -337,6 +337,7 @@ def render_histograms(city_json,thresholds,init,folder):
 def render_maps(tweek,pweek,indices,thresholds,starts,init,folder):
     import plotting
     plotting.TARGET_DATE=init.replace(tzinfo=None)
+    plotting.target_date=init.replace(tzinfo=None)
     folder.mkdir(exist_ok=True,parents=True)
     for n,start,arrays,lat2d,lon2d in build_map_probabilities(tweek,pweek,thresholds,indices,starts):
         # Legacy plot infers start by reading final four chars prior to ____, end-exclusive.

@@ -119,3 +119,8 @@ GRIB in processi diversi.
 - L'upload cerca esclusivamente `.webp`, controlla il numero atteso di file, imposta `ContentType="image/webp"` e verifica le dimensioni remote con `head_object()` se `R2_VERIFY_OBJECTS=1`.
 - La destinazione resta **la radice** del bucket R2 `settimanali`. I PNG precedenti rimangono nel bucket fino all'eventuale cancellazione manuale.
 - Rimane attiva la mitigazione v5 del crash nativo in chiusura Python, usata solo nel workflow GitHub dopo upload e verifica completati.
+
+
+## Aggiornamento v7
+
+Le mappe WebP delle settimanali ora seguono il blocco di plotting del flusso originario Leonardo, inclusi layout, legenda, hatching degli eventi estremi e naming dei file `subseasonal_YYYYMMDD_{2tp|tpp}.webp`.
