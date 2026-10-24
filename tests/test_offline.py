@@ -84,39 +84,50 @@ class FakeR2:
         self.calls = []
     def upload_file(self, path, bucket, key, ExtraArgs):
         self.calls.append((path, bucket, key, ExtraArgs))
+    def head_object(self, Bucket, Key):
+        matches = [c for c in self.calls if c[1] == Bucket and c[2] == Key]
+        if not matches:
+            raise AssertionError(f'HEAD: missing key {Key}')
+        return {'ContentLength': Path(matches[-1][0]).stat().st_size}
 
 
-def test_plot_png_and_upload(city_data, thresholds):
+def test_plot_webp_and_upload(city_data, thresholds):
     import plotting
     with tempfile.TemporaryDirectory() as td:
         out = Path(td)
         city = 'Bologna'
         weeks = sorted(city_data[city])
-        first = out / f'{city}_{weeks[0]}.png'
+        first = out / f'{city}_{weeks[0]}.webp'
         plotting.plot_city_combined(city, weeks, city_data[city],
                                     thresholds[city], str(first), '22/10/2026')
-        assert first.read_bytes()[:8] == b'\x89PNG\r\n\x1a\n'
-        second = out / 'subseasonal_20261026_2tp.png'
+        assert first.read_bytes()[:4] == b'RIFF'
+        assert first.read_bytes()[8:12] == b'WEBP'
+        from PIL import Image
+        with Image.open(first) as img:
+            assert img.format == 'WEBP'
+            assert img.width > 0 and img.height > 0
+        second = out / 'subseasonal_20261026_2tp.webp'
         second.write_bytes(first.read_bytes())
         client = FakeR2()
         with patch.dict(os.environ, {'R2_ACCOUNT_ID': 'example',
                                      'R2_ACCESS_KEY_ID': 'test',
                                      'R2_SECRET_ACCESS_KEY': 'test',
-                                     'R2_BUCKET': 'settimanali', 'R2_PREFIX': ''}):
-            assert pipeline.upload_pngs_to_r2(out, 2, client=client) == 2
+                                     'R2_BUCKET': 'settimanali', 'R2_PREFIX': '',
+                                     'R2_VERIFY_OBJECTS': '1'}):
+            assert pipeline.upload_webps_to_r2(out, 2, client=client) == 2
             assert {c[2] for c in client.calls} == {first.name, second.name}
             assert all(c[1] == 'settimanali' for c in client.calls)
-            assert all(c[3]['ContentType'] == 'image/png' for c in client.calls)
+            assert all(c[3]['ContentType'] == 'image/webp' for c in client.calls)
         assert not list(out.glob('*.nc')) and not list(out.glob('*.json'))
         try:
             with patch.dict(os.environ, {'R2_ACCOUNT_ID': 'x',
                                          'R2_ACCESS_KEY_ID': 'x',
                                          'R2_SECRET_ACCESS_KEY': 'x'}):
-                pipeline.upload_pngs_to_r2(out, 3, client=client)
+                pipeline.upload_webps_to_r2(out, 3, client=client)
         except RuntimeError as ex:
             assert 'Upload annullato' in str(ex)
         else:
-            raise AssertionError('Missing PNG count was not rejected')
+            raise AssertionError('Missing WebP count was not rejected')
 
 
 def test_all():
@@ -146,8 +157,8 @@ def test_all():
     _, _, arrays, _, _ = next(pipeline.build_map_probabilities(tw, pw, thresholds, indices, starts))
     assert arrays['2tp'].shape == (13, 58, 136)
     assert np.allclose(arrays['2tp'][:5].sum(axis=0), 100, atol=.01)
-    test_plot_png_and_upload(city_data, thresholds)
-    print('TEST OFFLINE PASS: date, ECDS API request, GRIB maths, quintiles, PNG, R2 mock')
+    test_plot_webp_and_upload(city_data, thresholds)
+    print('TEST OFFLINE PASS: date, ECDS API request, GRIB maths, quintiles, WebP, R2 mock')
 
 
 if __name__ == '__main__':
