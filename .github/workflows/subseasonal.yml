@@ -3,7 +3,7 @@ name: MeteoD ECMWF S2S → Cloudflare R2
 on:
   schedule:
     # Ogni giorno alle 12:15 UTC: run ECMWF delle 00 UTC di 2 giorni prima
-    - cron: '30 04 * * *'
+    - cron: '15 12 * * *'
   workflow_dispatch:
     inputs:
       run_date:
@@ -19,7 +19,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  create-and-publish-png:
+  create-and-publish-webp:
     runs-on: ubuntu-latest
     timeout-minutes: 330
     env:
@@ -33,6 +33,8 @@ jobs:
       RUN_DATE: ${{ inputs.run_date }}
       PYTHONUNBUFFERED: '1'
       MPLBACKEND: Agg
+      PYTHONFAULTHANDLER: '1'
+      R2_VERIFY_OBJECTS: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,10 +51,10 @@ jobs:
           python -m pip install -r requirements.txt
       - name: Test offline
         run: python tests/test_offline.py
-      - name: ECDS API -> quintili -> PNG -> Cloudflare R2
+      - name: ECDS API -> quintili -> WebP -> Cloudflare R2
         run: |
           if [ -n "$RUN_DATE" ]; then
-            python pipeline.py --date "$RUN_DATE" --output output
+            python -u -c 'import os, pipeline; pipeline.main(); print("Pipeline completata, chiusura sicura post-upload", flush=True); os._exit(0)' --date "$RUN_DATE" --output output
           else
-            python pipeline.py --output output
+            python -u -c 'import os, pipeline; pipeline.main(); print("Pipeline completata, chiusura sicura post-upload", flush=True); os._exit(0)' --output output
           fi
