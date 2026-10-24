@@ -4,12 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       run_date:
-        description: 'Run ECMWF (YYYY-MM-DD; vuoto = ultima emissione disponibile)'
+        description: 'Emissione ECMWF YYYY-MM-DD; vuoto = data UTC odierna meno 2 giorni'
         required: false
         type: string
   schedule:
-    # Lunedì -> giovedì; giovedì -> domenica, dopo la finestra di 48h dell'ECDS.
-    - cron: '0 14 * * 0,4'
+    # Ogni giorno alle 12:15 UTC: chiede la run delle 00 UTC di due giorni prima.
+    - cron: '15 12 * * *'
 
 permissions:
   contents: read
