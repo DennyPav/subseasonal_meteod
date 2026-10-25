@@ -3,7 +3,7 @@ name: MeteoD ECMWF S2S → Cloudflare R2
 on:
   schedule:
     # Ogni giorno alle 12:15 UTC: run ECMWF delle 00 UTC di 2 giorni prima
-    - cron: '30 04 * * *'
+    - cron: '15 12 * * *'
   workflow_dispatch:
     inputs:
       run_date:
