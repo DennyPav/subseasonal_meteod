@@ -177,8 +177,7 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
         subtitle = ""
 
     main_title_text = "Weekly Anomaly Probability - Temperature 2m" if varname == "2tp" else "Weekly Anomaly Probability - Total Precipitation"
-    full_title = r"$\bf{" + main_title_text.replace(" ", r"\ ") + r"}$" + f"
-{subtitle}"
+    full_title = r"$\bf{" + main_title_text.replace(" ", r"\ ") + r"}$" + f"\n{subtitle}"
     ax.set_title(full_title, fontsize=12, loc="center", pad=10, linespacing=1.5)
 
     # --- LEGGENDA: contenitore + subgriglia ---

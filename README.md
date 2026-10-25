@@ -2,6 +2,48 @@
 
 **Senza Leonardo.** Ogni giorno GitHub Actions scarica da ECMWF ECDS la previsione S2S della **data UTC di due giorni prima**. Interpola i membri dell'ensemble sulla griglia **0,4°** degli indici `assets/province_index_mediterraneo_0.4.json`; calcola i quintili rispetto alle soglie di `assets/soglie_settimanali_med.json.gz` e genera i plot MeteoD in **WebP**. Alla fine li carica su Cloudflare R2. Non crea NetCDF, JSON di risultati, né altri output da pubblicare. I GRIB intermedi sono in una cartella temporanea cancellata automaticamente.
 
+
+## Correzione bias settimanale della temperatura (nuova versione)
+
+L'asset **`assets/bias_s2s_minus_era5_2015_2020_04_smooth.nc`** contiene il
+bias climatologico della temperatura media a 2 m nel periodo 2015–2020:
+`bias = S2S t2m - ERA5 t2m` (52 settimane, °C). È un file di **input statico**
+incluso nel repository: non viene caricato su Cloudflare e non deve essere
+scaricato a ogni esecuzione. Per sostituirlo con una climatologia aggiornata,
+sostituire il file in `assets` senza cambiare codice.
+
+Dopo l'interpolazione dei GRIB sulla griglia operativa 0,4°, ma **prima** di
+calcolare probabilità/istogrammi, ogni membro dell'ensemble è corretto in ogni
+pixel: `T_corretta = T_S2S - bias`. La stessa correzione additiva è applicata
+a tutti i membri di un pixel; preserva quindi la dispersione ensemble.
+**Nessuna correzione viene applicata alle precipitazioni.** Le soglie cittadine
+esistenti non sono modificate.
+
+Il bias usa settimane climatologiche fisse dall'1 gennaio (1–7 gennaio,
+8–14 gennaio, ..., settimana 52). Le settimane previsionali sono lunedì–domenica
+e possono attraversare due settimane climatologiche o il nuovo anno: il bias
+per la previsione è la media **dei 7 bias giornalieri corrispondenti** alla
+finestra lunedì–domenica (bias giornaliero inteso come mappa della relativa
+settimana climatologica). Il 29 febbraio viene assegnato alla settimana del
+28 febbraio e il 31 dicembre alla settimana 52, perché la climatologia
+contiene soltanto 52 × 7 giorni.
+
+Il NetCDF fornito ha coordinate **centro-cella** di 58×135 punti, mentre la
+griliate di previsione originale usa 58×136 **nodi**. Il bias viene quindi
+riallineato una sola volta con interpolazione bilineare. Nei dati allegati sono
+presenti 3 righe di bias mancanti a nord e 3 a sud (in ogni settimana): tali
+zone vengono riempite con il pixel disponibile più vicino prima del
+riallineamento. Anche i nodi appena esterni ai centri delle celle sono limitati
+al centro valido più vicino; la correzione in quelle fasce costituisce quindi
+una **estrapolazione approssimata**, non un bias osservato localmente.
+Il log segnala quanti valori sono stati estesi. Se il file manca o le
+coordinate/unità/definizione sono incompatibili, la pipeline si ferma prima
+del download.
+
+Le mappe di probabilità e i 151 istogrammi delle località useranno le
+**temperature corrette**. I prodotti pubblicati rimangono solo WebP e le
+precipitazioni non cambiano. Non vengono prodotti NetCDF di output.
+
 ## Directory di Cloudflare confermata dal vecchio codice
 
 Il codice Leonardo aveva `R2_BUCKET_NAME = "settimanali"` e chiamava `upload_file(file_path, "settimanali", filename)`. Quindi il percorso è la **radice del bucket `settimanali`**, non `settimanali/PLOT/` né altre sottocartelle. La v6 replica questa disposizione: `R2_BUCKET=settimanali` e `R2_PREFIX=''`. È possibile impostare un prefisso diverso soltanto se il sito usa realmente un'altra directory.
@@ -53,7 +95,7 @@ L'esecuzione normale `python pipeline.py --output output` esegue anche l'upload 
 
 ## Limitazioni della versione semplificata
 
-- **Non è una correzione del bias**: esegue soltanto interpolazione bilineare dei campi ECMWF su 0,4°.
+- **Aggiornato:** ora la temperatura viene corretta mediante il NetCDF del bias prima di mappe e istogrammi, mentre le precipitazioni mantengono la procedura originale.
 - Le soglie fornite sono per *località*. Le mappe utilizzano soglie interpolate spazialmente e sono quindi **approssimazioni**, non quintili ottenuti da una climatologia ERA5 grigliata.
 - Le aree colorate continuano a usare l'approssimazione grafica originale `40/20/40` riscalata, **non veri tercili**.
 - L'accesso ECMWF reale, la decodifica dei GRIB scaricati, le mappe Cartopy e l'upload reale R2 necessitano della prima esecuzione completa su GitHub. I test offline verificano calcoli e WebP e simulano l'upload senza trasferire dati.

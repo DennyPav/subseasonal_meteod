@@ -5,6 +5,7 @@ IMPORTANT: spatially interpolated city thresholds used for maps are an APPROXIMA
 not a gridded ERA5 climatology. City histograms use the ORIGINAL per-city thresholds.
 """
 import argparse
+import calendar
 import gzip
 import json
 import os
@@ -12,14 +13,17 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
+import h5py
 import numpy as np
 import pandas as pd
 import xarray as xr
-from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator, RegularGridInterpolator
+from scipy.ndimage import distance_transform_edt
 from scipy.spatial import Delaunay
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / 'assets'
+TEMPERATURE_BIAS_FILE = DATA_DIR / 'bias_s2s_minus_era5_2015_2020_04_smooth.nc'
 LATS = np.round(52.0 - np.arange(58, dtype=np.float64) * 0.4, 6)
 LONS = np.round(-12.0 + np.arange(136, dtype=np.float64) * 0.4, 6)
 GRID_SHAPE = (len(LATS), len(LONS))
@@ -242,6 +246,159 @@ def weekly_interpolated(da, starts, var):
     return result.transpose('week','member','latitude','longitude')
 
 
+
+def climatological_week_for_day(day):
+    """Index 0..51: Jan 1-7, Jan 8-14, ... on a no-leap calendar.
+
+    Feb 29 takes Feb 28's bin; Dec 31 takes week 52 because the
+    52 seven-day bins cover only 364 calendar days. This matches the
+    calendar used to build the attached S2S/ERA5 bias climatology.
+    """
+    if isinstance(day, datetime):
+        day = day.date()
+    day_of_year = (day - day.replace(month=1, day=1)).days
+    if calendar.isleap(day.year):
+        if day.month == 2 and day.day == 29:
+            day_of_year -= 1  # same 0-based index as Feb 28
+        elif (day.month, day.day) > (2, 29):
+            day_of_year -= 1
+    return min(day_of_year // 7, 51)
+
+
+def load_temperature_bias():
+    """Read 52 weekly S2S-minus-ERA5 maps and resample to pipeline grid.
+
+    The NetCDF is cell-centred (58x135), whereas our forecast maps are
+    point-centred (58x136). Interpolation is bilinear. In the supplied
+    reference, the northern/southern three rows have missing bias: we
+    extend the closest valid bias there rather than leaving ensemble
+    temperature uncorrected or allowing missing values into probabilities.
+    """
+    if not TEMPERATURE_BIAS_FILE.is_file():
+        raise FileNotFoundError(f'File bias temperatura mancante: {TEMPERATURE_BIAS_FILE}')
+
+    with h5py.File(TEMPERATURE_BIAS_FILE, 'r') as nc:
+        expected_vars = ('bias', 'week', 'latitude', 'longitude')
+        missing = [key for key in expected_vars if key not in nc]
+        if missing:
+            raise ValueError(f'NetCDF bias incompleto; variabili mancanti: {missing}')
+        weeks = np.asarray(nc['week'][:])
+        source_lat = np.asarray(nc['latitude'][:], dtype=np.float64)
+        source_lon = np.asarray(nc['longitude'][:], dtype=np.float64)
+        values = np.asarray(nc['bias'][:], dtype=np.float64)
+        if values.shape != (52, len(source_lat), len(source_lon)):
+            raise ValueError(f'Dimensioni bias inattese: {values.shape}')
+        if not np.array_equal(weeks, np.arange(1, 53)):
+            raise ValueError('La coordinata week del bias deve essere 1..52')
+        if not (np.all(np.diff(source_lat) < 0) or np.all(np.diff(source_lat) > 0)):
+            raise ValueError('Latitudini bias non monotone')
+        if not (np.all(np.diff(source_lon) < 0) or np.all(np.diff(source_lon) > 0)):
+            raise ValueError('Longitudini bias non monotone')
+        units = nc['bias'].attrs.get('units', '')
+        if isinstance(units, bytes):
+            units = units.decode('utf-8')
+        if str(units).strip().lower() not in ('degc', 'c', 'celsius', 'degree_celsius'):
+            raise ValueError(f'Unita bias non attese: {units!r} (servono gradi Celsius)')
+        definition = nc.attrs.get('bias_definition', '')
+        if isinstance(definition, bytes):
+            definition = definition.decode('utf-8')
+        if str(definition).strip() != 'S2S t2m - ERA5 t2m':
+            raise ValueError(f'Definizione bias non compatibile con sottrazione: {definition!r}')
+
+    # Sort source axes, ensuring strictly ascending coordinates for scipy.
+    lat_order = np.argsort(source_lat)
+    lon_order = np.argsort(source_lon)
+    source_lat = source_lat[lat_order]
+    source_lon = source_lon[lon_order]
+    if np.any(np.diff(source_lat) <= 0) or np.any(np.diff(source_lon) <= 0):
+        raise ValueError('Coordinate bias duplicate')
+    values = values[:, lat_order, :][:, :, lon_order]
+
+    # Allow just the half-cell overhang between target cell-centres and
+    # forecast points; never project a bias across an unrelated domain.
+    step = 0.4
+    if (LATS.max() > source_lat.max() + 2 * step
+        or LATS.min() < source_lat.min() - 2 * step
+        or LONS.max() > source_lon.max() + 2 * step
+        or LONS.min() < source_lon.min() - 2 * step):
+        raise ValueError('Griglia bias non compatibile con il dominio delle previsioni S2S')
+
+    lat_mesh, lon_mesh = np.meshgrid(
+        np.clip(LATS, source_lat[0], source_lat[-1]),
+        np.clip(LONS, source_lon[0], source_lon[-1]), indexing='ij'
+    )
+    targets = np.stack((lat_mesh.ravel(), lon_mesh.ravel()), axis=-1)
+
+    correction = np.empty((52, *GRID_SHAPE), dtype=np.float32)
+    missing_count = 0
+    for i in range(52):
+        field = values[i]
+        finite = np.isfinite(field)
+        if not np.any(finite):
+            raise ValueError(f'Settimana bias {i + 1}: nessun pixel valido')
+        missing_count += int((~finite).sum())
+        if not np.all(finite):
+            # Only fill spatial holes in the bias field. In particular the
+            # provided dataset has exactly three empty northern and three
+            # empty southern rows, common to every week.
+            nearest_indices = distance_transform_edt(~finite, return_distances=False,
+                                                     return_indices=True)
+            field = field[tuple(nearest_indices)]
+        interpolator = RegularGridInterpolator(
+            (source_lat, source_lon), field,
+            method='linear', bounds_error=True
+        )
+        correction[i] = interpolator(targets).reshape(GRID_SHAPE).astype(np.float32)
+
+    if not np.isfinite(correction).all():
+        raise ValueError('Remapping bias ha prodotto valori non finiti')
+    print(f'BIAS TEMPERATURA: {TEMPERATURE_BIAS_FILE.name}; '
+          f'{len(correction)} settimane, griglia {GRID_SHAPE}, '
+          f'pixel mancanti sorgente {missing_count}/{values.size} '
+          '(riempiti dal pixel valido più vicino prima del remapping)', flush=True)
+    return correction
+
+
+def correct_ensemble_temperature(tweek, starts, weekly_bias):
+    """Subtract S2S-ERA5 bias at every pixel of EVERY ensemble member.
+
+    Forecast weeks are Monday-Sunday, unlike the 7-day fixed climatological
+    bins from January 1. Average the seven daily corresponding bias maps
+    to give the correct bias for the whole forecast week, including weeks
+    crossing a climatological bin or year boundary.
+    """
+    if tweek.sizes.get('week') != len(starts):
+        raise ValueError('Numero settimane previsionali incompatibile con le date')
+    if not np.allclose(tweek.latitude.values, LATS, atol=1e-6, rtol=0):
+        raise ValueError('La griglia latitudine della previsione non corrisponde al bias')
+    if not np.allclose(tweek.longitude.values, LONS, atol=1e-6, rtol=0):
+        raise ValueError('La griglia longitudine della previsione non corrisponde al bias')
+    if weekly_bias.shape != (52, *GRID_SHAPE) or not np.isfinite(weekly_bias).all():
+        raise ValueError('Campo bias 52 settimane non valido')
+
+    corrections = np.stack([
+        np.mean([weekly_bias[climatological_week_for_day(start + timedelta(days=d))]
+                 for d in range(7)], axis=0)
+        for start in starts
+    ], axis=0).astype(np.float32)  # (week, latitude, longitude)
+
+    # Subtraction broadcasts to all members, never changes their spread.
+    corrected = (tweek.values - corrections[:, None, :, :]).astype(np.float32)
+    output = tweek.copy(data=corrected)
+    output.attrs.update({
+        'temperature_bias_correction': 'T_corrected = T_S2S - (S2S t2m - ERA5 t2m)',
+        'temperature_bias_file': TEMPERATURE_BIAS_FILE.name,
+        'bias_time_mapping': '7 daily no-leap climatological week indices per forecast week',
+    })
+    for n, start in enumerate(starts):
+        bins = [climatological_week_for_day(start + timedelta(days=d)) + 1
+                for d in range(7)]
+        print(f'  Bias W{n+1} ({start:%Y-%m-%d}): '
+              f'settimane climatologiche {bins}, '
+              f'media bias {np.mean(corrections[n]):+.2f} °C', flush=True)
+    return output
+
+
 def quintile_probs(fc, bounds):
     """fc: (members, lat, lon) or (members,), bounds: (4, lat,lon) or (4,).
        Outputs: (5,lat,lon) or (5,); equality goes to the lower quintile.
@@ -436,6 +593,7 @@ def main(argv=None):
     starts = week_starts(init)
     indices, thresholds = load_assets()
     check_threshold_weeks(indices, thresholds, starts)
+    bias_weekly = load_temperature_bias()  # fail before downloading if asset is invalid
     print('RUN ECMWF S2S UTC', init.strftime('%Y-%m-%d'),
           'Grid', GRID_SHAPE, 'Locations', len(indices), flush=True)
     print('Weeks:', ', '.join(s.strftime('%Y-%m-%d') for s in starts), flush=True)
@@ -465,6 +623,9 @@ def main(argv=None):
         tw = weekly_interpolated(t, starts, 't2m')
         pw = weekly_interpolated(p, starts, 'tp')
         del t, p
+        # Correct each ensemble member BEFORE both city and map probabilities.
+        # Precipitation remains untouched.
+        tw = correct_ensemble_temperature(tw, starts, bias_weekly)
         city_data = city_probabilities(tw, pw, indices, thresholds, starts)
         render_histograms(city_data, thresholds, init, image_dir / 'citta')
         if not args.no_maps:
