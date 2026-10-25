@@ -40,23 +40,23 @@ def test_dates_and_ecd_api():
         (datetime(2026, 11, 1, 12, 15, tzinfo=timezone.utc), '2026-10-30'),
     ]:
         assert pipeline.date_from_args(now=value).strftime('%Y-%m-%d') == expected
-    for variable, api_name in [('t2m', '2_m_temperature'), ('tp', 'total_precipitation')]:
-        req = pipeline.request_for(datetime(2026, 10, 22, tzinfo=timezone.utc), variable)
-        assert req['variable'] == [api_name]
-        assert req['origin'] == 'ecmwf'
-        assert req['forecast_type'] == 'perturbed_forecast'
-        assert req['data_format'] == 'grib'
-        assert req['area'] == [54, -14, 28, 44]
-        assert req['year'] == '2026' and req['month'] == '10' and req['day'] == '22'
-        assert req['time'] == '00:00' and req['level_type'] == 'single_level'
-        assert len(req['leadtime_hour']) == 46
-        assert 'class' not in req and 'param' not in req and 'step' not in req
-    assert pipeline.request_for(datetime(2026, 10, 22, tzinfo=timezone.utc), 't2m')['leadtime_hour'][:2] == ['0_24','24_48']
-    assert pipeline.request_for(datetime(2026, 10, 22, tzinfo=timezone.utc), 'tp')['leadtime_hour'][:2] == ['24','48']
+    req = pipeline.request_for(datetime(2026, 10, 22, tzinfo=timezone.utc))
+    assert req['variable'] == ['2_m_temperature', 'total_precipitation']
+    assert req['origin'] == 'ecmwf'
+    assert req['forecast_type'] == 'perturbed_forecast'
+    assert req['data_format'] == 'grib'
+    assert req['area'] == [54, -14, 28, 44]
+    assert req['year'] == '2026' and req['month'] == '10' and req['day'] == '22'
+    assert req['time'] == '00:00' and req['level_type'] == 'single_level'
+    assert len(req['leadtime_hour']) == 92
+    assert req['leadtime_hour'][:2] == ['0_24', '24_48']
+    assert req['leadtime_hour'][46:48] == ['24', '48']
+    assert req['leadtime_hour'][-1] == '1104'
+    assert 'class' not in req and 'param' not in req and 'step' not in req
 
 
 def test_cds_api_download_mock():
-    """The ECDS client must use the official cdsapi retrieve/result/download flow."""
+    """Download MUST make one ECDS request containing both parameters."""
     requests = []
     class FakeResult:
         def download(self, filename):
@@ -71,12 +71,72 @@ def test_cds_api_download_mock():
     with tempfile.TemporaryDirectory() as td, \
          patch.dict(os.environ, {'ECDS_API_KEY': 'dummy-token'}), \
          patch.dict(sys.modules, {'cdsapi': types.SimpleNamespace(Client=FakeClient)}):
-        files = pipeline.download_grib(datetime(2026,10,22,tzinfo=timezone.utc), Path(td))
-        assert set(files) == {'t2m', 'tp'}
-        assert len(requests) == 2
-        assert all(f.exists() and f.read_bytes()[:4] == b'GRIB' for f in files.values())
-        assert requests[0]['variable'] == ['2_m_temperature']
-        assert requests[1]['variable'] == ['total_precipitation']
+        file = pipeline.download_grib(datetime(2026,10,22,tzinfo=timezone.utc), Path(td))
+        assert file.is_file() and file.read_bytes().startswith(b'GRIB')
+        assert file.name == 'ecmwf_s2s_t2m_tp_20261022.grib'
+        assert len(requests) == 1
+        assert requests[0]['variable'] == ['2_m_temperature', 'total_precipitation']
+        # Existing cached file -> no second API request.
+        pipeline.download_grib(datetime(2026,10,22,tzinfo=timezone.utc), Path(td))
+        assert len(requests) == 1
+
+
+def test_split_combined_grib_mock():
+    """Check GRIB metadata routing, order independence, and ZIP input.
+
+    The ecCodes API is mocked, so no remote service or system GRIB libraries
+    are needed. Each output stream must contain ONLY its parameter.
+    """
+    from zipfile import ZipFile
+    init = datetime(2026,10,22,tzinfo=timezone.utc)
+    messages = [
+        {'shortName': 'tp', 'stepType': 'accum', 'blob': b'GRIB-P1'},
+        {'shortName': 'mean2t24', 'stepType': 'avg', 'blob': b'GRIB-T1'},
+        {'shortName': 'tp', 'stepType': 'accum', 'blob': b'GRIB-P2'},
+        {'shortName': 'mean2t24', 'stepType': 'avg', 'blob': b'GRIB-T2'},
+    ]
+    def fake_new(f):
+        # Simulate a low-memory GRIB stream parser; a real ecCodes parser
+        # extracts messages from the file rather than using this list.
+        nextmsg = getattr(f, '_mock_idx', 0)
+        if nextmsg >= len(messages):
+            return None
+        f._mock_idx = nextmsg + 1
+        return messages[nextmsg]
+    def fake_get(gid, key):
+        return gid[key]
+    fake_codes = types.SimpleNamespace(
+        codes_grib_new_from_file=fake_new,
+        codes_get=fake_get,
+        codes_get_message=lambda gid: gid['blob'],
+        codes_release=lambda gid: None,
+    )
+    with tempfile.TemporaryDirectory() as td, \
+         patch.dict(sys.modules, {'eccodes': fake_codes}):
+        directory = Path(td)
+        source = directory / 'joint.grib'
+        source.write_bytes(b'GRIB' + b'\x00'*128)
+        paths = pipeline.split_combined_grib(source, directory, init)
+        assert paths['t2m'].read_bytes() == b'GRIB-T1GRIB-T2'
+        assert paths['tp'].read_bytes() == b'GRIB-P1GRIB-P2'
+        assert source.is_file()  # combined file preserved
+        # ZIP response: GRIB extraction does not modify the source archive.
+        archive = directory / 'joint.zip'
+        with ZipFile(archive, 'w') as z:
+            z.writestr('part.grib', b'GRIB' + b'\x00'*128)
+        paths_zip = pipeline.split_combined_grib(archive, directory, init)
+        assert paths_zip['t2m'].read_bytes() == b'GRIB-T1GRIB-T2'
+        assert paths_zip['tp'].read_bytes() == b'GRIB-P1GRIB-P2'
+        assert not list(directory.glob('.ecds_archive_part_*'))
+
+    # Strictly forbid maximum temperatures from being misused with mean bias.
+    bad_temperature = {'shortName': 'mx2t24', 'stepType': 'max'}
+    try:
+        pipeline._grib_product(bad_temperature, lambda gid, key: gid[key])
+    except ValueError as ex:
+        assert 'non è media' in str(ex)
+    else:
+        raise AssertionError('La massima giornaliera non è una media')
 
 
 class FakeR2:
@@ -187,9 +247,62 @@ def test_temperature_bias_correction():
     print('TEST BIAS PASS: file, calendario, remapping, tutti i membri, segno e spread')
 
 
+
+def test_gridded_percentile_classification(tw, pw, indices, thresholds, starts,
+                                           era5, era5_bounds, city_data, first_map):
+    """Probabilities use P20/P40/P60/P80 at the pixel; city JSON for labels only."""
+    import h5py
+    from datetime import timedelta
+    assert set(era5) == {'T', 'P'}
+    for kind in ('T', 'P'):
+        assert era5[kind].shape == (52, 4, 58, 136)
+        assert era5_bounds[kind].shape == (len(starts), 4, 58, 136)
+        assert np.isfinite(era5_bounds[kind]).all()
+        assert np.all(np.diff(era5_bounds[kind], axis=1) >= -1e-4)
+
+    # Real data check: exact source grid centre at 51.8N/-11.8E matches the
+    # NetCDF field, even after latitude flip and interpolation.
+    with h5py.File(pipeline.ERA5_PERCENTILES_FILE) as h:
+        nlat, nlon = 51.8, -11.8
+        # Target grid is 52, 51.6,... and -12, -11.6,... .
+        # Compare interpolation at the internal midpoint to nearby source cells.
+        r, c = 1, 1  # target 51.6, -11.6
+        assert np.isclose(pipeline.LATS[r], 51.6)
+        assert np.isclose(pipeline.LONS[c], -11.6)
+        # 51.6 is midpoint of 51.8 and 51.4; -11.6 between -11.8/-11.4
+        expected = np.mean(h['t2m_p20'][0, 0:2, 0:2])
+        assert np.isclose(era5['T'][0,0,r,c], expected, atol=1e-4)
+
+    # Matches the same daily-weighted climatology used by the bias correction.
+    idx = [pipeline.climatological_week_for_day(starts[0] + timedelta(days=d)) for d in range(7)]
+    assert np.allclose(era5_bounds['T'][0], np.mean(era5['T'][idx],axis=0), atol=1e-5)
+
+    city = 'Bologna'
+    i, j = indices[city]
+    expected_t = pipeline.quintile_probs(tw.isel(week=0,latitude=i,longitude=j).values,
+                                         era5_bounds['T'][0,:,i,j])
+    expected_p = pipeline.quintile_probs(pw.isel(week=0,latitude=i,longitude=j).values,
+                                         era5_bounds['P'][0,:,i,j])
+    k = starts[0].strftime('%Y%m%d')
+    actual = city_data[city][k]
+    for kq in range(5):
+        assert np.isclose(actual[f'T_{kq+1}'],pipeline.rounded_proba(expected_t)[kq],atol=1e-3)
+        assert np.isclose(actual[f'P_{kq+1}'],pipeline.rounded_proba(expected_p)[kq],atol=1e-3)
+        assert np.isclose(first_map['2tp'][kq,i,j],expected_t[kq],atol=1e-3)
+        assert np.isclose(first_map['tpp'][kq,i,j],expected_p[kq],atol=1e-3)
+
+    # When the historical city JSON is changed, classification is unchanged.
+    # No old city label table is passed into the probability functions:
+    # ERA5 gridded thresholds are the only classification inputs.
+    again = pipeline.city_probabilities(tw, pw, indices, era5_bounds, starts)
+    assert again[city][k] == actual
+    print('TEST ERA5 PERCENTILES PASS: both variables, same pixel for city/map, daily mix, city labels only')
+
+
 def test_all():
     test_dates_and_ecd_api()
     test_cds_api_download_mock()
+    test_split_combined_grib_mock()
     test_temperature_bias_correction()
     init = datetime(2026, 10, 22, tzinfo=timezone.utc)
     starts = pipeline.week_starts(init)
@@ -207,16 +320,19 @@ def test_all():
     assert np.allclose(tw.values, tw_0360.values, equal_nan=True)
     assert tw.shape == (5, 12, 58, 136) and pw.shape == tw.shape
     assert np.isclose(float(pw.isel(week=0, member=0, latitude=0, longitude=0)), 14, atol=.1)
-    city_data = pipeline.city_probabilities(tw, pw, indices, thresholds, starts)
+    era5 = pipeline.load_era5_weekly_percentiles()
+    era5_bounds = pipeline.thresholds_for_forecast_weeks(era5, starts)
+    city_data = pipeline.city_probabilities(tw, pw, indices, era5_bounds, starts)
     assert len(city_data) == 151
     for rec in city_data['Bologna'].values():
         assert abs(sum(rec[f'T_{i}'] for i in range(1, 6)) - 100) < .001
         assert abs(sum(rec[f'P_{i}'] for i in range(1, 6)) - 100) < .001
-    _, _, arrays, _, _ = next(pipeline.build_map_probabilities(tw, pw, thresholds, indices, starts))
+    _, _, arrays, _, _ = next(pipeline.build_map_probabilities(tw, pw, era5_bounds, starts))
     assert arrays['2tp'].shape == (13, 58, 136)
     assert np.allclose(arrays['2tp'][:5].sum(axis=0), 100, atol=.01)
+    test_gridded_percentile_classification(tw, pw, indices, thresholds, starts, era5, era5_bounds, city_data, arrays)
     test_plot_webp_and_upload(city_data, thresholds)
-    print('TEST OFFLINE PASS: date, ECDS API request, GRIB maths, quintiles, WebP, R2 mock')
+    print('TEST OFFLINE PASS: date, ECDS API request, GRIB maths, percentili ERA5 grigliati, WebP, R2 mock')
 
 
 if __name__ == '__main__':
