@@ -1,0 +1,60 @@
+name: MeteoD ECMWF S2S → Cloudflare R2
+
+on:
+  schedule:
+    # Ogni giorno alle 12:15 UTC: run ECMWF delle 00 UTC di 2 giorni prima
+    - cron: '15 12 * * *'
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: 'Emissione YYYY-MM-DD (vuoto = 2 giorni fa UTC)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meteod-subseasonal
+  cancel-in-progress: false
+
+jobs:
+  create-and-publish-webp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      ECDS_API_KEY: ${{ secrets.ECDS_API_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: settimanali
+      # NESSUNA sottocartella: come nel vecchio script Leonardo
+      R2_PREFIX: ''
+      RUN_DATE: ${{ inputs.run_date }}
+      PYTHONUNBUFFERED: '1'
+      MPLBACKEND: Agg
+      PYTHONFAULTHANDLER: '1'
+      R2_VERIFY_OBJECTS: '1'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install Python and GRIB libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes0 libeccodes-dev
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Test offline
+        run: python tests/test_offline.py
+      - name: ECDS API -> quintili -> WebP -> Cloudflare R2
+        run: |
+          if [ -n "$RUN_DATE" ]; then
+            python -u -c 'import os, pipeline; pipeline.main(); print("Pipeline completata, chiusura sicura post-upload", flush=True); os._exit(0)' --date "$RUN_DATE" --output output
+          else
+            python -u -c 'import os, pipeline; pipeline.main(); print("Pipeline completata, chiusura sicura post-upload", flush=True); os._exit(0)' --output output
+          fi
