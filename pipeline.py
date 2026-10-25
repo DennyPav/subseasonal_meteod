@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """MeteoD S2S 0.4°: ECDS ECMWF -> ensemble weekly -> WebP -> Cloudflare R2.
 
-IMPORTANT: spatially interpolated city thresholds used for maps are an APPROXIMATION,
-not a gridded ERA5 climatology. City histograms use the ORIGINAL per-city thresholds.
+ERA5 gridded weekly percentiles (P20/P40/P60/P80) are the sole quintile
+classification thresholds for both maps and city histograms. Historical
+city thresholds are retained ONLY as displayed boundary labels in charts.
 """
 import argparse
 import calendar
@@ -10,6 +11,7 @@ import gzip
 import json
 import os
 import tempfile
+import zipfile
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
@@ -17,13 +19,13 @@ import h5py
 import numpy as np
 import pandas as pd
 import xarray as xr
-from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator, RegularGridInterpolator
+from scipy.interpolate import RegularGridInterpolator
 from scipy.ndimage import distance_transform_edt
-from scipy.spatial import Delaunay
 
 BASE = Path(__file__).resolve().parent
 DATA_DIR = BASE / 'assets'
 TEMPERATURE_BIAS_FILE = DATA_DIR / 'bias_s2s_minus_era5_2015_2020_04_smooth.nc'
+ERA5_PERCENTILES_FILE = DATA_DIR / 'era5_week_percentiles_2006_2025_conservative_04_smooth.nc'
 LATS = np.round(52.0 - np.arange(58, dtype=np.float64) * 0.4, 6)
 LONS = np.round(-12.0 + np.arange(136, dtype=np.float64) * 0.4, 6)
 GRID_SHAPE = (len(LATS), len(LONS))
@@ -80,27 +82,22 @@ def check_threshold_weeks(indices, thresholds, starts):
                     raise ValueError(f'Soglie non valide {city} {datecode} {v}: {a}')
 
 
-def request_for(init, param):
-    """Select S2S data using the *official ECDS form fields*, not raw MARS syntax.
+# A single CDS-API selection can contain the two parameters and both kinds
+# of lead time: the daily mean-temperature intervals, and the accumulated
+# precipitation forecast endpoints. They are then split LOCALLY by GRIB
+# metadata so cfgrib can decode the different step types independently.
+TEMP_STEPS = [f'{h}_{h+24}' for h in range(0, 1104, 24)]
+PRECIP_STEPS = [str(h) for h in range(24, 1105, 24)]
 
-    Mirrors the user-supplied `s2s-forecasts` example:
-        origin / year / month / day / time / level_type / variable /
-        forecast_type / leadtime_hour / data_format / area.
 
-    The S2S daily 2m temperature is archived as intervals `0_24`, etc.
-    Total precipitation is cumulative since initialization. Request 24-hour
-    endpoints only: subtraction of adjacent endpoints yields daily mm while
-    avoiding downloading 6-hourly steps we do not need for weekly products.
+def request_for(init, param=None):
+    """One ECDS request for temperature AND precipitation, all 46 daily steps.
+
+    A `param` argument is not supported: callers must not accidentally
+    issue a second request or lose one variable from the retrieval.
     """
-    if param == 't2m':
-        variable = '2_m_temperature'
-        leadtimes = [f'{h}_{h+24}' for h in range(0, 1104, 24)]
-    elif param == 'tp':
-        variable = 'total_precipitation'
-        leadtimes = [str(h) for h in range(24, 1105, 24)]
-    else:
-        raise ValueError(f'Parametro non previsto: {param}')
-
+    if param is not None:
+        raise ValueError('Il download è congiunto: chiamare request_for(init) senza parametro')
     return {
         'origin': 'ecmwf',
         'year': init.strftime('%Y'),
@@ -108,47 +105,188 @@ def request_for(init, param):
         'day': init.strftime('%d'),
         'time': '00:00',
         'level_type': 'single_level',
-        'variable': [variable],
+        'variable': ['2_m_temperature', 'total_precipitation'],
         'forecast_type': 'perturbed_forecast',
-        'leadtime_hour': leadtimes,
+        # Keep each source product's native step representation.
+        # Numeric cumulative endpoints are not interchangeable with
+        # the temperature intervals (0_24, 24_48, ...).
+        'leadtime_hour': TEMP_STEPS + PRECIP_STEPS,
         'data_format': 'grib',
-        # Margin for bilinear interpolation at all target-grid boundaries.
         'area': [54, -14, 28, 44],
     }
 
 
 def download_grib(init, raw_dir):
+    """Submit exactly ONE ECDS job; cache its combined GRIB or ZIP result."""
     token = os.getenv('ECDS_API_KEY')
     if not token:
         raise RuntimeError('ECDS_API_KEY non configurata. Usare GitHub Secrets (o variabile ambiente).')
     import cdsapi
     client = cdsapi.Client(url='https://ecds.ecmwf.int/api', key=token)
-    paths = {}
     raw_dir.mkdir(parents=True, exist_ok=True)
-    for var in ('t2m', 'tp'):
-        path = raw_dir / f'ecmwf_s2s_{var}_{init:%Y%m%d}.grib'
-        if not path.exists() or path.stat().st_size == 0:
-            request = request_for(init, var)
-            print('ECDS download', var, init.strftime('%Y%m%d'), flush=True)
-            print('  variable =', request['variable'], flush=True)
-            print('  leadtime_hour =', len(request['leadtime_hour']), 'step', flush=True)
-            tmp = path.with_suffix('.grib.partial')
-            if tmp.exists():
-                tmp.unlink()
-            # ECDS CDS-API returns a job/result whose download() retrieves the GRIB.
-            client.retrieve('s2s-forecasts', request).download(str(tmp))
-            if not tmp.exists() or tmp.stat().st_size < 100:
-                raise RuntimeError(f'Download ECDS vuoto: {tmp}')
-            with tmp.open('rb') as f:
-                magic = f.read(4)
-            if magic != b'GRIB':
-                raise RuntimeError(
-                    f'La risposta ECDS non è un GRIB (magic={magic!r}): {tmp}. '
-                    'Controlla log ECDS e data_format.'
-                )
-            tmp.replace(path)
-        print('GRIB', path, 'MB=', round(path.stat().st_size / 1e6, 1), flush=True)
-        paths[var] = path
+    path = raw_dir / f'ecmwf_s2s_t2m_tp_{init:%Y%m%d}.grib'
+    if not path.exists() or path.stat().st_size == 0:
+        request = request_for(init)
+        print('ECDS download UNICO', init.strftime('%Y%m%d'), flush=True)
+        print('  variable =', request['variable'], flush=True)
+        print('  leadtime_hour =', len(request['leadtime_hour']),
+              f'({len(TEMP_STEPS)} temperatura + {len(PRECIP_STEPS)} precipitazione)', flush=True)
+        tmp = path.with_suffix('.grib.partial')
+        if tmp.exists():
+            tmp.unlink()
+        # One request and one result, even though it contains two variables.
+        client.retrieve('s2s-forecasts', request).download(str(tmp))
+        if not tmp.exists() or tmp.stat().st_size < 100:
+            raise RuntimeError(f'Download ECDS vuoto: {tmp}')
+        with tmp.open('rb') as f:
+            magic = f.read(4)
+        if magic != b'GRIB' and not zipfile.is_zipfile(tmp):
+            raise RuntimeError(
+                f'La risposta ECDS non contiene GRIB/ZIP (magic={magic!r}): {tmp}. '
+                'Controlla log ECDS e data_format.'
+            )
+        tmp.replace(path)
+    print('DOWNLOAD', path, 'MB=', round(path.stat().st_size / 1e6, 1), flush=True)
+    return path
+
+
+def _grib_product(gid, codes_get):
+    """Classify GRIB messages by physical parameter, not file order.
+
+    Temperature must be a 2-m MEAN (not tmax/tmin): otherwise subtracting
+    an ERA5 t2m climatological bias would be physically incorrect.
+    """
+    def field(name, default=None):
+        try:
+            return codes_get(gid, name)
+        except Exception:
+            return default
+
+    short = str(field('shortName', '')).lower()
+    name = str(field('name', '')).lower()
+    stat = str(field('stepType', '')).lower()
+    if short in ('mx2t24', 'mn2t24', 'mx2t6', 'mn2t6') or stat in ('max', 'min'):
+        if '2t' in short or 'temperature' in name:
+            raise ValueError(f'La temperatura scaricata non è media: {short}, stepType={stat}')
+
+    discipline = field('discipline')
+    category = field('parameterCategory')
+    number = field('parameterNumber')
+    param_id = field('paramId')
+    type_of_level = str(field('typeOfLevel', ''))
+    level = field('level')
+    at_2m = (type_of_level == 'heightAboveGround' and str(level) in ('2', '2.0'))
+
+    # ECMWF's mean2t24 is a daily averaged 2m temperature; depending on
+    # encoding it may retain generic shortName '2t'.
+    is_temp = short in ('mean2t24', '2t', 't2m', '2_m_temperature') or (
+        discipline == 0 and category == 0 and number == 0 and at_2m
+    )
+    if is_temp:
+        if short in ('2t', 't2m', '2_m_temperature') and not at_2m:
+            raise ValueError(f'Temperatura non a 2 m: {short}, level={type_of_level}:{level}')
+        # For generic instantaneous 2t the 24-hour mean is NOT guaranteed.
+        if stat not in ('avg', 'average', 'mean'):
+            raise ValueError(f'S2S: attesa temperatura MEDIA giornaliera, trovato {short}, stepType={stat}')
+        return 't2m'
+
+    is_tp = short in ('tp', 'total_precipitation') or (
+        discipline == 0 and category == 1 and number == 8
+    )
+    if is_tp:
+        if stat not in ('accum', 'accumulation', 'sum'):
+            raise ValueError(f'S2S: precipitazione non accumulata: {short}, stepType={stat}')
+        return 'tp'
+
+    # Do not silently drop unexpected GRIB messages from a mixed request.
+    raise ValueError(f'Parametro GRIB inatteso: shortName={short}, paramId={param_id}, '
+                     f'parameterCategory={category}, parameterNumber={number}, '
+                     f'stepType={stat}')
+
+
+def split_combined_grib(source, raw_dir, init):
+    """Split mixed GRIB into two parameter-specific streams locally.
+
+    This avoids the multiple-hypercube/open_dataset errors that cfgrib may
+    produce when averaged temperature and accumulated precipitation have
+    different forecast-step keys. GRIB messages are copied without changes.
+    Supports a single GRIB stream and a ZIP containing one/more GRIB files.
+    """
+    from eccodes import (codes_grib_new_from_file, codes_get, codes_get_message,
+                         codes_release)
+
+    source = Path(source)
+    raw_dir = Path(raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    paths = {key: raw_dir / f'ecmwf_s2s_{key}_{init:%Y%m%d}.grib'
+             for key in ('t2m', 'tp')}
+    tmps = {key: path.with_suffix('.grib.partial') for key, path in paths.items()}
+    for path in tmps.values():
+        path.unlink(missing_ok=True)
+    counts = {'t2m': 0, 'tp': 0}
+
+    def process_grib(fileobj, outfiles):
+        while True:
+            gid = codes_grib_new_from_file(fileobj)
+            if gid is None:
+                break
+            try:
+                var = _grib_product(gid, codes_get)
+                outfiles[var].write(codes_get_message(gid))
+                counts[var] += 1
+            finally:
+                codes_release(gid)
+
+    try:
+        with tmps['t2m'].open('wb') as temp_out, tmps['tp'].open('wb') as precip_out:
+            streams = {'t2m': temp_out, 'tp': precip_out}
+            if zipfile.is_zipfile(source):
+                # Some CDS-API backends package GRIB outputs as a ZIP.
+                with zipfile.ZipFile(source) as archive:
+                    members = [item for item in archive.infolist() if not item.is_dir()]
+                    if not members:
+                        raise ValueError(f'ZIP ECDS vuoto: {source}')
+                    # A ZipExtFile is not guaranteed to support the seek/fileno
+                    # operations expected by ecCodes; unpack each member to
+                    # a temporary file, then delete it immediately.
+                    import shutil
+                    grib_members = 0
+                    for i, item in enumerate(members):
+                        scratch = raw_dir / f'.ecds_archive_part_{i}.grib'
+                        try:
+                            with archive.open(item) as src, scratch.open('wb') as dst:
+                                shutil.copyfileobj(src, dst, length=1024*1024)
+                            with scratch.open('rb') as f:
+                                if f.read(4) != b'GRIB':
+                                    # ZIP responses may contain a manifest/text file.
+                                    continue
+                                grib_members += 1
+                                f.seek(0)
+                                process_grib(f, streams)
+                        finally:
+                            scratch.unlink(missing_ok=True)
+                    if grib_members == 0:
+                        raise ValueError(f'ZIP ECDS senza contenuto GRIB: {source}')
+            else:
+                with source.open('rb') as f:
+                    if f.read(4) != b'GRIB':
+                        raise ValueError(f'File combinato non GRIB: {source}')
+                    f.seek(0)
+                    process_grib(f, streams)
+        if not all(counts.values()):
+            raise ValueError(f'Download congiunto incompleto: messaggi {counts}. '
+                             'Verificare la selezione dei leadtime_hour nel Data Store.')
+        for var in ('t2m', 'tp'):
+            tmps[var].replace(paths[var])
+    except Exception:
+        for path in tmps.values():
+            path.unlink(missing_ok=True)
+        for path in paths.values():
+            path.unlink(missing_ok=True)
+        raise
+
+    print(f'SPLIT LOCALE GRIB: temperatura={counts["t2m"]} messaggi; '
+          f'precipitazione={counts["tp"]} messaggi', flush=True)
     return paths
 
 
@@ -399,6 +537,115 @@ def correct_ensemble_temperature(tweek, starts, weekly_bias):
     return output
 
 
+def load_era5_weekly_percentiles():
+    """Read ERA5 per-pixel P20/P40/P60/P80 and align to the forecast's nodes.
+
+    Input grid: 58 x 135 cell centres (longitude -11.8 ... 41.8).
+    Forecast:   58 x 136 sample nodes (longitude -12.0 ... 42.0).
+    Edge nodes are clamped by <= one half-cell to the nearest valid centre;
+    internal nodes are bilinearly interpolated. No city values are used.
+
+    Returns {'T': (52,4,58,136), 'P': (52,4,58,136)} float32.
+    """
+    if not ERA5_PERCENTILES_FILE.is_file():
+        raise FileNotFoundError(f'NetCDF percentili ERA5 mancante: {ERA5_PERCENTILES_FILE}')
+
+    with h5py.File(ERA5_PERCENTILES_FILE, 'r') as nc:
+        variable_names = {
+            'T': [f't2m_p{q}' for q in QUANTILES],
+            'P': [f'tp_p{q}' for q in QUANTILES],
+        }
+        required = {'latitude', 'longitude', 'week',
+                    *(name for names in variable_names.values() for name in names)}
+        missing = sorted(required - set(nc.keys()))
+        if missing:
+            raise ValueError(f'File percentili incompleto: {missing}')
+        weeks = np.asarray(nc['week'][:])
+        if not np.array_equal(weeks, np.arange(1, 53)):
+            raise ValueError('Percentili ERA5: week deve essere 1..52')
+        src_lat = np.asarray(nc['latitude'][:], dtype=np.float64)
+        src_lon = np.asarray(nc['longitude'][:], dtype=np.float64)
+        if src_lat.ndim != 1 or src_lon.ndim != 1:
+            raise ValueError('Percentili ERA5: coordinate latitude/longitude devono essere 1D')
+        if len(src_lat) < 2 or len(src_lon) < 2:
+            raise ValueError('Percentili ERA5: griglia troppo piccola')
+        order_lat = np.argsort(src_lat)
+        order_lon = np.argsort(src_lon)
+        src_lat = src_lat[order_lat]
+        src_lon = src_lon[order_lon]
+        if np.any(np.diff(src_lat) <= 0) or np.any(np.diff(src_lon) <= 0):
+            raise ValueError('Percentili ERA5: coordinate duplicate/non monotone')
+        if (LATS.max() > src_lat.max() + 0.4 or LATS.min() < src_lat.min() - 0.4
+            or LONS.max() > src_lon.max() + 0.4 or LONS.min() < src_lon.min() - 0.4):
+            raise ValueError('Percentili ERA5: griglia geografica non compatibile con le mappe')
+        target_lat, target_lon = np.meshgrid(
+            np.clip(LATS, src_lat[0], src_lat[-1]),
+            np.clip(LONS, src_lon[0], src_lon[-1]), indexing='ij'
+        )
+        targets = np.stack((target_lat.ravel(), target_lon.ravel()), axis=-1)
+        output = {}
+        for kind, names in variable_names.items():
+            cubes = []
+            for name in names:
+                var = nc[name]
+                units = var.attrs.get('units', b'')
+                if isinstance(units, bytes):
+                    units = units.decode('utf-8')
+                expected = ('degc', 'c', 'celsius', 'degree_celsius') if kind == 'T' else ('mm',)
+                if str(units).strip().lower() not in expected:
+                    raise ValueError(f'Percentili ERA5: unità inattesa {name}={units!r}')
+                values = np.asarray(var[:], dtype=np.float32)
+                if values.shape != (52, len(order_lat), len(order_lon)):
+                    raise ValueError(f'{name}: shape inattesa {values.shape}')
+                values = values[:, order_lat, :][:, :, order_lon]
+                if not np.isfinite(values).all():
+                    raise ValueError(f'{name}: soglie ERA5 non finite (NaN): non uso fallback cittadino')
+                dest = np.empty((52, *GRID_SHAPE), dtype=np.float32)
+                for wi, field in enumerate(values):
+                    interp = RegularGridInterpolator(
+                        (src_lat, src_lon), field, method='linear', bounds_error=True
+                    )
+                    dest[wi] = interp(targets).reshape(GRID_SHAPE).astype(np.float32)
+                cubes.append(dest)
+            cube = np.stack(cubes, axis=1)  # 52 weeks, 4 thresholds, lat, lon
+            if (np.diff(cube, axis=1) < -1e-4).any():
+                raise ValueError(f'Percentili ERA5 {kind}: P20/P40/P60/P80 non ordinati')
+            if not np.isfinite(cube).all():
+                raise ValueError(f'Percentili ERA5 {kind}: problemi nel remapping')
+            output[kind] = cube
+
+    print(f'SOGLIE QUINTILI ERA5: {ERA5_PERCENTILES_FILE.name}; '
+          f'52 settimane, T e P, 4 percentili, griglia {GRID_SHAPE}; '
+          'estremi spaziali limitati al centro-cella più vicino', flush=True)
+    return output
+
+
+def thresholds_for_forecast_weeks(weekly_percentiles, starts):
+    """Average daily-matched climatological boundaries across each forecast week.
+
+    For a Mon-Sun forecast week straddling fixed Jan-1 ERA5 week boundaries,
+    a 7-day weighted mixture of weekly percentile MAPS is used, just as for
+    the temperature bias. This is an approximation to the percentile of the
+    shifted 7-day window, which cannot be recovered from weekly quantiles alone.
+
+    Returns (nforecastweeks, 4 thresholds, lat, lon) for T and P.
+    """
+    indices = np.array([
+        [climatological_week_for_day(start + timedelta(days=d)) for d in range(7)]
+        for start in starts
+    ], dtype=np.int16)
+    out = {}
+    for kind in ('T', 'P'):
+        source = np.asarray(weekly_percentiles[kind])
+        if source.shape != (52, 4, *GRID_SHAPE) or not np.isfinite(source).all():
+            raise ValueError(f'Percentili ERA5 {kind}: shape o valori non validi')
+        weekly = source[indices].mean(axis=1).astype(np.float32)
+        if (np.diff(weekly, axis=1) < -1e-4).any():
+            raise ValueError(f'Percentili ERA5 {kind}: soglie risultanti non ordinate')
+        out[kind] = weekly
+    return out
+
+
 def quintile_probs(fc, bounds):
     """fc: (members, lat, lon) or (members,), bounds: (4, lat,lon) or (4,).
        Outputs: (5,lat,lon) or (5,); equality goes to the lower quintile.
@@ -419,66 +666,45 @@ def rounded_proba(vals):
     return r.tolist()
 
 
-def city_probabilities(tweek,pweek, indices, thresholds, starts):
-    """Uses EACH city's OWN climatological percentiles without interpolation."""
-    out={}
-    for city,(row,col) in indices.items():
-        perweek={}
-        for n,start in enumerate(starts[:4]):
-            key=start.strftime('%Y%m%d')
-            record=thresholds[city][key]
-            arrs={}
-            for name,weather,kind in [('T',tweek,'T'),('P',pweek,'P')]:
-                series=weather.isel(week=n,latitude=row,longitude=col).values
-                bounds=np.array([record[f'{kind}_p{k}'] for k in QUANTILES])
-                probs=quintile_probs(series,bounds)
-                arrs.update({f'{name}_{k+1}':v for k,v in enumerate(rounded_proba(probs))})
-            perweek[key]=arrs
-        out[city]=perweek
+def city_probabilities(tweek, pweek, indices, era5_bounds, starts):
+    """Classify ensembles with the exact ERA5 pixel thresholds of each city.
+
+    The legacy JSON city thresholds do NOT enter probability calculations:
+    they are passed only to plot_city_combined() for boundary labels.
+    """
+    out = {}
+    for city, (row, col) in indices.items():
+        perweek = {}
+        for n, start in enumerate(starts[:4]):
+            key = start.strftime('%Y%m%d')
+            arrs = {}
+            for name, weather in (('T', tweek), ('P', pweek)):
+                series = weather.isel(week=n, latitude=row, longitude=col).values
+                bounds = era5_bounds[name][n, :, row, col]
+                probs = quintile_probs(series, bounds)
+                arrs.update({f'{name}_{k+1}': v for k, v in enumerate(rounded_proba(probs))})
+            perweek[key] = arrs
+        out[city] = perweek
     return out
 
 
-class ApproximateMapThresholds:
-    """Interpolate climatology *between city points* to build map-only approximations.
-       Not a substitute for gridded ERA5 climatology. Duplicate locations are averaged.
-    """
-    def __init__(self,indices):
-        groups={}
-        for city,(row,col) in indices.items():
-            groups.setdefault((row,col),[]).append(city)
-        self.groups=groups
-        self.points=np.array([[LONS[j],LATS[i]] for i,j in groups],dtype=float)
-        self.lon2d,self.lat2d=np.meshgrid(LONS,LATS)
-        self.tri=Delaunay(self.points)
-    def bounds(self, city_thresholds, start, kind):
-        key=start.strftime('%Y%m%d')
-        source=np.array([[np.mean([city_thresholds[city][key][f'{kind}_p{q}'] for city in cities]) for q in QUANTILES] for cities in self.groups.values()],dtype=float)
-        linear=LinearNDInterpolator(self.tri,source,fill_value=np.nan)(self.lon2d,self.lat2d)
-        if np.isnan(linear).any():
-            nearest=NearestNDInterpolator(self.points,source)(self.lon2d,self.lat2d)
-            linear=np.where(np.isnan(linear),nearest,linear)
-        bounds=np.maximum.accumulate(linear,axis=-1)
-        return np.moveaxis(bounds,-1,0) # (4,lat,lon)
-
-
-def build_map_probabilities(tweek,pweek, thresholds, indices, starts):
-    interpolator=ApproximateMapThresholds(indices)
-    for n,start in enumerate(starts):
-        t_bounds=interpolator.bounds(thresholds,start,'T')
-        p_bounds=interpolator.bounds(thresholds,start,'P')
-        tprob=quintile_probs(tweek.isel(week=n).values,t_bounds)
-        pprob=quintile_probs(pweek.isel(week=n).values,p_bounds)
-        # layout exactly as plot_terciles_week() in original Leonardo script:
-        # first 5 quintiles, positions 10..12 sum of Q1+Q2, Q3, Q4+Q5.
-        arrays={}
-        for field, probs in [('2tp',tprob),('tpp',pprob)]:
-            arr=np.full((13,*GRID_SHAPE),np.nan,dtype=np.float32)
-            arr[:5]=probs
-            arr[10]=probs[0]+probs[1]
-            arr[11]=probs[2]
-            arr[12]=probs[3]+probs[4]
-            arrays[field]=arr
-        yield n,start,arrays,interpolator.lat2d,interpolator.lon2d
+def build_map_probabilities(tweek, pweek, era5_bounds, starts):
+    """Map probabilities with gridded ERA5 thresholds, NEVER city interpolation."""
+    lon2d, lat2d = np.meshgrid(LONS, LATS)
+    for n, start in enumerate(starts):
+        t_bounds = era5_bounds['T'][n]
+        p_bounds = era5_bounds['P'][n]
+        tprob = quintile_probs(tweek.isel(week=n).values, t_bounds)
+        pprob = quintile_probs(pweek.isel(week=n).values, p_bounds)
+        arrays = {}
+        for field, probs in (('2tp', tprob), ('tpp', pprob)):
+            arr = np.full((13, *GRID_SHAPE), np.nan, dtype=np.float32)
+            arr[:5] = probs
+            arr[10] = probs[0] + probs[1]
+            arr[11] = probs[2]
+            arr[12] = probs[3] + probs[4]
+            arrays[field] = arr
+        yield n, start, arrays, lat2d, lon2d
 
 
 def render_histograms(city_json,thresholds,init,folder):
@@ -491,12 +717,12 @@ def render_histograms(city_json,thresholds,init,folder):
     print(f'Grafici località prodotti: {len(city_json)}',flush=True)
 
 
-def render_maps(tweek,pweek,indices,thresholds,starts,init,folder):
+def render_maps(tweek,pweek,era5_bounds,starts,init,folder):
     import plotting
     plotting.TARGET_DATE=init.replace(tzinfo=None)
     plotting.target_date=init.replace(tzinfo=None)
     folder.mkdir(exist_ok=True,parents=True)
-    for n,start,arrays,lat2d,lon2d in build_map_probabilities(tweek,pweek,thresholds,indices,starts):
+    for n,start,arrays,lat2d,lon2d in build_map_probabilities(tweek,pweek,era5_bounds,starts):
         # Legacy plot infers start by reading final four chars prior to ____, end-exclusive.
         end_exclusive=start+timedelta(days=7)
         key=f'S2F{init:%m%d}{end_exclusive:%m%d}____ECDS'
@@ -594,11 +820,13 @@ def main(argv=None):
     indices, thresholds = load_assets()
     check_threshold_weeks(indices, thresholds, starts)
     bias_weekly = load_temperature_bias()  # fail before downloading if asset is invalid
+    era5_percentiles = load_era5_weekly_percentiles()  # also validates all gridded thresholds
+    era5_bounds = thresholds_for_forecast_weeks(era5_percentiles, starts)
     print('RUN ECMWF S2S UTC', init.strftime('%Y-%m-%d'),
           'Grid', GRID_SHAPE, 'Locations', len(indices), flush=True)
     print('Weeks:', ', '.join(s.strftime('%Y-%m-%d') for s in starts), flush=True)
     if args.dry_run:
-        print(json.dumps({p: request_for(init, p) for p in ('t2m', 'tp')}, indent=2))
+        print(json.dumps(request_for(init), indent=2))
         return
     if not args.no_upload:
         validate_r2_config()  # fail early if secrets are missing
@@ -610,12 +838,20 @@ def main(argv=None):
     with tempfile.TemporaryDirectory(prefix='meteod_ecdsv4_') as temp:
         if args.grib_dir:
             raw = Path(args.grib_dir).resolve()
-            paths = {v: raw / f'ecmwf_s2s_{v}_{init:%Y%m%d}.grib' for v in ('t2m', 'tp')}
-            for path in paths.values():
-                if not path.is_file():
-                    raise FileNotFoundError(path)
+            combined = raw / f'ecmwf_s2s_t2m_tp_{init:%Y%m%d}.grib'
+            if combined.is_file():
+                # Never alter source files supplied by --grib-dir.
+                paths = split_combined_grib(combined, Path(temp), init)
+            else:
+                # Backward compatibility with old saved GRIB pairs.
+                paths = {v: raw / f'ecmwf_s2s_{v}_{init:%Y%m%d}.grib'
+                         for v in ('t2m', 'tp')}
+                for path in paths.values():
+                    if not path.is_file():
+                        raise FileNotFoundError(path)
         else:
-            paths = download_grib(init, Path(temp))
+            combined = download_grib(init, Path(temp))
+            paths = split_combined_grib(combined, Path(temp), init)
         t = normalize_da(read_grib_da(paths['t2m']), init, 't2m')
         p = normalize_da(read_grib_da(paths['tp']), init, 'tp')
         if not np.array_equal(t['member'].values, p['member'].values):
@@ -626,10 +862,11 @@ def main(argv=None):
         # Correct each ensemble member BEFORE both city and map probabilities.
         # Precipitation remains untouched.
         tw = correct_ensemble_temperature(tw, starts, bias_weekly)
-        city_data = city_probabilities(tw, pw, indices, thresholds, starts)
+        city_data = city_probabilities(tw, pw, indices, era5_bounds, starts)
+        # Only the printed values at the quintile boundaries use old city JSON.
         render_histograms(city_data, thresholds, init, image_dir / 'citta')
         if not args.no_maps:
-            render_maps(tw, pw, indices, thresholds, starts, init, image_dir / 'mappe')
+            render_maps(tw, pw, era5_bounds, starts, init, image_dir / 'mappe')
     expected = len(indices) + (0 if args.no_maps else 2 * len(starts))
     if args.no_upload:
         webps = list(image_dir.rglob('*.webp'))

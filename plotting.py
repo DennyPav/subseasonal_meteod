@@ -123,7 +123,7 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
         transform=ccrs.PlateCarree()
     )
 
-    # Percentili estremi: mantieni l'orientamento geografico
+    # Percentili estremi (quintili 1 e 5 preparati a monte)
     p10 = array[0, :, :]
     p90 = array[4, :, :]
 

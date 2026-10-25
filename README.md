@@ -1,6 +1,6 @@
-# MeteoD S2S ECDS → WebP → Cloudflare R2 (v6)
+# MeteoD S2S ECDS → WebP → Cloudflare R2 (v10 – soglie ERA5 su griglia)
 
-**Senza Leonardo.** Ogni giorno GitHub Actions scarica da ECMWF ECDS la previsione S2S della **data UTC di due giorni prima**. Interpola i membri dell'ensemble sulla griglia **0,4°** degli indici `assets/province_index_mediterraneo_0.4.json`; calcola i quintili rispetto alle soglie di `assets/soglie_settimanali_med.json.gz` e genera i plot MeteoD in **WebP**. Alla fine li carica su Cloudflare R2. Non crea NetCDF, JSON di risultati, né altri output da pubblicare. I GRIB intermedi sono in una cartella temporanea cancellata automaticamente.
+**Senza Leonardo.** Ogni giorno GitHub Actions scarica da ECMWF ECDS la previsione S2S della **data UTC di due giorni prima**. Interpola i membri dell'ensemble sulla griglia **0,4°** degli indici `assets/province_index_mediterraneo_0.4.json`; calcola i quintili usando i percentili **ERA5 P20/P40/P60/P80 per ogni pixel** da `assets/era5_week_percentiles_2006_2025_conservative_04_smooth.nc` e genera i plot MeteoD in **WebP**. Alla fine li carica su Cloudflare R2. Non crea NetCDF, JSON di risultati, né altri output da pubblicare. I GRIB intermedi sono in una cartella temporanea cancellata automaticamente.
 
 
 ## Correzione bias settimanale della temperatura (nuova versione)
@@ -16,8 +16,8 @@ Dopo l'interpolazione dei GRIB sulla griglia operativa 0,4°, ma **prima** di
 calcolare probabilità/istogrammi, ogni membro dell'ensemble è corretto in ogni
 pixel: `T_corretta = T_S2S - bias`. La stessa correzione additiva è applicata
 a tutti i membri di un pixel; preserva quindi la dispersione ensemble.
-**Nessuna correzione viene applicata alle precipitazioni.** Le soglie cittadine
-esistenti non sono modificate.
+**Nessuna correzione viene applicata alle precipitazioni.** Le soglie cittadine storiche nel JSON non sono modificate, ma non vengono più
+utilizzate per calcolare le probabilità.
 
 Il bias usa settimane climatologiche fisse dall'1 gennaio (1–7 gennaio,
 8–14 gennaio, ..., settimana 52). Le settimane previsionali sono lunedì–domenica
@@ -44,9 +44,52 @@ Le mappe di probabilità e i 151 istogrammi delle località useranno le
 **temperature corrette**. I prodotti pubblicati rimangono solo WebP e le
 precipitazioni non cambiano. Non vengono prodotti NetCDF di output.
 
+## Soglie dei quintili: ERA5 2006–2025, griglia 0,4° (v10)
+
+L'asset statico `assets/era5_week_percentiles_2006_2025_conservative_04_smooth.nc`
+contiene i **quattro percentili** P20, P40, P60, P80 per `t2m` (°C) e
+`tp` (mm per settimana), ciascuno con 52 mappe geografiche. Questo è
+**l'unico input delle soglie** per classificare gli ensemble, sia nelle
+mappe sia negli istogrammi per le 151 località.
+
+- All'avvio, i campi ERA5 vengono letti e controllati (variabili, coordinate,
+  unità, NaN, ordine P20 ≤ P40 ≤ P60 ≤ P80). Un file mancante o incompleto
+  fa interrompere l'esecuzione **prima del download ECDS**.
+- I dati sono su **centri di cella** (58×135, incluso l'ultimo mezzo intervallo
+  meridionale), mentre i campi previsionali usano 58×136 nodi. Le mappe dei
+  percentili sono interpolate **bilinearmente** sui nodi della griglia
+  previsionale; solo per i punti appena oltre il primo/ultimo centro di cella
+  si utilizza il valore del centro più vicino (nessuna estrapolazione distante).
+- La climatologia ha 52 settimane di 7 giorni fissi a partire dal 1° gennaio.
+  La previsione è lunedì–domenica: per ciascuna settimana previsionale si
+  applica una media delle **sette mappe di soglia associate ai sette giorni**.
+  Questo è coerente con l'allineamento temporale del bias, ma resta
+  un'approssimazione: i percentili della settimana lunedì–domenica esatta
+  non si possono ricostruire rigorosamente dai soli percentili di settimane
+  fisse.
+- Per ciascun pixel, i 50 membri (temperatura già corretta per il bias,
+  precipitazione non corretta) vengono confrontati con le quattro soglie.
+  Quindi `Q1: <=P20`, `Q2: (P20,P40]`, `Q3: (P40,P60]`,
+  `Q4: (P60,P80]`, `Q5: >P80`. La probabilità è la percentuale
+  di membri che ricadono nel quintile.
+- **Le stesse soglie grigliate** vengono lette nel pixel della città per
+  calcolare le percentuali degli istogrammi. In particolare, i numeri
+  in `assets/soglie_settimanali_med.json.gz` NON influenzano più la
+  classificazione (neppure sulle mappe). Il vecchio JSON è conservato
+  **esclusivamente per stampare P0/P20/P40/P60/P80/P100 ai bordi delle
+  barre degli istogrammi**, come esplicitamente richiesto. Per questo tali
+  etichette possono differire dalle soglie grigliate che determinano le
+  percentuali visualizzate.
+
+La palette per le mappe (Q1+Q2 / Q3 / Q4+Q5, peso doppio al centrale e
+contorni Q1/Q5 ≥80%) non è stata modificata. Il download congiunto di
+`2_m_temperature` e `total_precipitation`, la correzione del bias di tutti
+i membri della sola temperatura, gli istogrammi e la pubblicazione R2
+rimangono invariati.
+
 ## Directory di Cloudflare confermata dal vecchio codice
 
-Il codice Leonardo aveva `R2_BUCKET_NAME = "settimanali"` e chiamava `upload_file(file_path, "settimanali", filename)`. Quindi il percorso è la **radice del bucket `settimanali`**, non `settimanali/PLOT/` né altre sottocartelle. La v6 replica questa disposizione: `R2_BUCKET=settimanali` e `R2_PREFIX=''`. È possibile impostare un prefisso diverso soltanto se il sito usa realmente un'altra directory.
+Il codice Leonardo aveva `R2_BUCKET_NAME = "settimanali"` e chiamava `upload_file(file_path, "settimanali", filename)`. Quindi il percorso è la **radice del bucket `settimanali`**, non `settimanali/PLOT/` né altre sottocartelle. La pipeline replica questa disposizione: `R2_BUCKET=settimanali` e `R2_PREFIX=''`. È possibile impostare un prefisso diverso soltanto se il sito usa realmente un'altra directory.
 
 Esempi di chiavi R2:
 
@@ -78,7 +121,7 @@ Per una data ECMWF come `2026-10-22` genera **161 WebP**:
 - 10 mappe: 5 settimane × temperatura (`2tp`) e precipitazione (`tpp`).
 - 151 istogrammi per le località del file `province_index_mediterraneo_0.4.json`, ciascuno con le prime quattro settimane.
 
-Gli unici file di output locali sono sotto `output/20261022/mappe/` e `output/20261022/citta/`, tutti `.webp`. Non esistono JSON di output, NetCDF o matrici salvate. I riferimenti `assets/*.json*` sono **input statici indispensabili** per costruire gli istogrammi e i campi di probabilità.
+Gli unici file di output locali sono sotto `output/20261022/mappe/` e `output/20261022/citta/`, tutti `.webp`. Non esistono JSON di output, NetCDF o matrici salvate. Gli asset NetCDF e JSON inclusi sono **input statici**: il NetCDF dei percentili determina le probabilità, il NetCDF del bias corregge la temperatura, il JSON delle soglie cittadine stampa soltanto i valori ai confini dei quintili negli istogrammi.
 
 Il caricamento sul bucket mantiene i soli nomi dei file, senza la struttura `mappe/` e `citta/`, come faceva Leonardo. L'header HTTP `Content-Type` è `image/webp` e il TTL cache è 300 secondi, utile perché gli oggetti per una stessa settimana possono venire aggiornati il giorno dopo. Le mappe future vengono sovrascritte dalla previsione più recente se il loro nome coincide; gli oggetti più vecchi non vengono cancellati.
 
@@ -96,7 +139,7 @@ L'esecuzione normale `python pipeline.py --output output` esegue anche l'upload 
 ## Limitazioni della versione semplificata
 
 - **Aggiornato:** ora la temperatura viene corretta mediante il NetCDF del bias prima di mappe e istogrammi, mentre le precipitazioni mantengono la procedura originale.
-- Le soglie fornite sono per *località*. Le mappe utilizzano soglie interpolate spazialmente e sono quindi **approssimazioni**, non quintili ottenuti da una climatologia ERA5 grigliata.
+- **Risolto in v10:** sia le mappe sia gli istogrammi usano esclusivamente soglie ERA5 calcolate pixel per pixel; non si interpolano più le soglie dalle città. Le etichette numeriche sui bordi degli istogrammi provengono invece dal vecchio JSON e potrebbero non coincidere esattamente con le soglie effettive.
 - Le aree colorate continuano a usare l'approssimazione grafica originale `40/20/40` riscalata, **non veri tercili**.
 - L'accesso ECMWF reale, la decodifica dei GRIB scaricati, le mappe Cartopy e l'upload reale R2 necessitano della prima esecuzione completa su GitHub. I test offline verificano calcoli e WebP e simulano l'upload senza trasferire dati.
 - L'upload R2 non è una transazione atomica: se fallisce dopo alcuni oggetti, il workflow termina in errore e alcuni file potrebbero risultare già aggiornati; basta rilanciare la run con la stessa data.
@@ -106,10 +149,25 @@ L'esecuzione normale `python pipeline.py --output output` esegue anche l'upload 
 
 Le richieste ora usano **esattamente i nomi dei campi del form ECDS**: `origin`, `year`, `month`, `day`, `time`, `level_type`, `variable`, `forecast_type`, `leadtime_hour`, `data_format`, `area`. Non si usa più la richiesta MARS manuale con `class`, `param` e `step`.
 
-Si effettuano **due richieste** al dataset `s2s-forecasts` per evitare che i lead times delle due variabili siano mescolati:
+Si effettua **una sola richiesta ECDS** al dataset `s2s-forecasts` con
+`variable=["2_m_temperature", "total_precipitation"]` e la selezione congiunta dei 92 valori `leadtime_hour`:
 
-- `variable=["2_m_temperature"]`: i 46 intervalli giornalieri `0_24`, `24_48`, ..., `1080_1104`;
-- `variable=["total_precipitation"]`: i 46 accumuli progressivi alle ore `24`, `48`, ..., `1104`. Vengono differenziati per ottenere il totale di ogni singolo giorno (mm). Scaricare anche i 6-hourly non serve per questa applicazione. La richiesta usa l'area ampliata `[54, -14, 28, 44]` esclusivamente per mantenere i punti necessari all'interpolazione bilineare: l'output finale resta sulla griglia 0,4° `[52, -12, 29, 42]`. Le longitudini GRIB 0–360° vengono ricondotte a −180–180° prima di interpolare.
+- temperatura: 46 intervalli giornalieri `0_24`, `24_48`, ..., `1080_1104`;
+- precipitazione: 46 accumuli progressivi alle ore `24`, `48`, ..., `1104`.
+
+ECDS prepara un solo job e restituisce un unico download. La pipeline separa
+**localmente** i messaggi GRIB usando i metadati fisici (`shortName`, categoria,
+stepType), non la posizione nel file. Accetta sia uno stream GRIB sia un archivio ZIP
+contenente GRIB; li passa separatamente a `cfgrib`, che gestisce le diverse
+coordinate temporali di temperatura e precipitazione. I GRIB intermedi restano
+nel `TemporaryDirectory` e sono eliminati dopo l'elaborazione. La precipitazione
+cumulata viene ancora differenziata per ottenere gli apporti giornalieri (mm).
+
+L'API reale ECDS non è verificabile nei test offline: se il backend non accetta
+questa selezione mista di lead time, la pipeline **fallisce esplicitamente** e
+non scarica i due parametri con due richieste di ripiego. Anche quando il download
+riesce, vengono controllati i 46 intervalli giornalieri e la coerenza dei membri.
+ Scaricare anche i 6-hourly non serve per questa applicazione. La richiesta usa l'area ampliata `[54, -14, 28, 44]` esclusivamente per mantenere i punti necessari all'interpolazione bilineare: l'output finale resta sulla griglia 0,4° `[52, -12, 29, 42]`. Le longitudini GRIB 0–360° vengono ricondotte a −180–180° prima di interpolare.
 
 L'accesso reale a ECDS non è stato verificato offline: **non è possibile garantire che l'errore interno `MarsRuntimeError` non si ripresenti** anche passando dalla sintassi ECDS ufficiale.
 
@@ -166,3 +224,20 @@ GRIB in processi diversi.
 ## Aggiornamento v7
 
 Le mappe WebP delle settimanali ora seguono il blocco di plotting del flusso originario Leonardo, inclusi layout, legenda, hatching degli eventi estremi e naming dei file `subseasonal_YYYYMMDD_{2tp|tpp}.webp`.
+
+
+## v9 — Download unico ECMWF ECDS (temperatura + precipitazione)
+
+Il download è ora un solo job per data (`ecmwf_s2s_t2m_tp_YYYYMMDD.grib`),
+contenente entrambe le variabili e l'unione dei loro lead time. Dopo il download
+lo script genera **in locale** due GRIB temporanei (`ecmwf_s2s_t2m_*.grib` e
+`ecmwf_s2s_tp_*.grib`), separando i messaggi con ecCodes. Questo permette di
+riutilizzare gli stessi metodi di aggregazione: temperatura media dei 7 giorni,
+precipitazione accumulata dei 7 giorni. La correzione di bias continua ad essere
+applicata pixel per pixel a ogni membro **solo alla temperatura**.
+
+`python pipeline.py --dry-run` stampa la singola richiesta ECDS, senza scaricare.
+`--grib-dir` accetta sia il nuovo file congiunto sia la coppia di file precedenti.
+
+Il supporto della combinazione di intervalli e lead time cumulativi in un'unica
+richiesta deve essere verificato con la prima esecuzione reale sul servizio ECDS.
