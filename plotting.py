@@ -290,7 +290,7 @@ def plot_terciles_week(week_key, array, varname, output_dir, lat2d, lon2d):
         format="webp",
         dpi=150,
         bbox_inches="tight",
-        pil_kwargs={"quality": 70}
+        pil_kwargs={"quality": 65}
     )
     plt.close(fig)
 
