@@ -130,9 +130,67 @@ def test_plot_webp_and_upload(city_data, thresholds):
             raise AssertionError('Missing WebP count was not rejected')
 
 
+
+def test_temperature_bias_correction():
+    """True NetCDF asset, leap calendar, forecast-week weighting and members."""
+    from datetime import timedelta
+    with __import__('h5py').File(pipeline.TEMPERATURE_BIAS_FILE, 'r') as f:
+        assert list(f.keys()) == ['bias', 'latitude', 'longitude', 'week'] or set(f.keys()) == {'bias', 'latitude', 'longitude', 'week'}
+        assert f['bias'].shape == (52, 58, 135)
+        assert f['week'][:].tolist() == list(range(1, 53))
+    bias = pipeline.load_temperature_bias()
+    assert bias.shape == (52, 58, 136)
+    assert np.all(np.isfinite(bias))
+
+    # Jan 1 fixed weekly blocks, with leap day removed from the calendar.
+    assert pipeline.climatological_week_for_day(datetime(2026,1,1)) == 0
+    assert pipeline.climatological_week_for_day(datetime(2026,1,8)) == 1
+    assert pipeline.climatological_week_for_day(datetime(2028,2,28)) == 8
+    assert pipeline.climatological_week_for_day(datetime(2028,2,29)) == 8
+    assert pipeline.climatological_week_for_day(datetime(2028,3,1)) == 8
+    assert pipeline.climatological_week_for_day(datetime(2026,12,31)) == 51
+    assert pipeline.climatological_week_for_day(datetime(2027,1,1)) == 0
+
+    # Several forecast weeks, including crossings of two climatological bins
+    # and calendar years. Unique member offsets must remain intact.
+    starts = [datetime(2026,10,26,tzinfo=timezone.utc),
+              datetime(2026,12,28,tzinfo=timezone.utc),
+              datetime(2028,2,28,tzinfo=timezone.utc)]
+    offset = np.array([[-2.,0.,3.],[-4.,2.,6.],[-1.,3.,9.]], dtype=np.float32)
+    dummy = np.broadcast_to(offset[:, :, None, None],
+                            (len(starts), 3, 58, 136)).copy() + 15
+    coords = {'week': np.arange(1, len(starts)+1),
+              'member': np.array([1,2,3]),
+              'latitude': pipeline.LATS, 'longitude': pipeline.LONS}
+    da = xr.DataArray(dummy, dims=('week','member','latitude','longitude'), coords=coords)
+    da_original = da.copy(deep=True)
+    corrected = pipeline.correct_ensemble_temperature(da, starts, bias)
+
+    for n, start in enumerate(starts):
+        week_indices = [pipeline.climatological_week_for_day(start + timedelta(days=j)) for j in range(7)]
+        expected = np.mean(bias[week_indices], axis=0)
+        for member in range(3):
+            assert np.allclose(corrected.isel(week=n, member=member).values,
+                               dummy[n, member] - expected, atol=3e-6)
+        # The additive correction MUST NOT alter the ensemble spread.
+        assert np.allclose((corrected.isel(week=n,member=2) - corrected.isel(week=n,member=0)).values,
+                           dummy[n,2] - dummy[n,0], atol=3e-6)
+    # The original forecast is unchanged (temperature only in new output).
+    assert np.array_equal(da.values, da_original.values)
+    assert np.isfinite(corrected.values).all()
+
+    # A forecast exactly 2 deg warmer than ERA5 must become unbiased when
+    # S2S-ERA5 climatological bias is +2 deg, on ALL members and pixels.
+    synthetic_bias = np.full((52,58,136), 2., dtype=np.float32)
+    uniform = pipeline.correct_ensemble_temperature(da, starts, synthetic_bias)
+    assert np.allclose(uniform.values, da.values - 2, atol=1e-6)
+    print('TEST BIAS PASS: file, calendario, remapping, tutti i membri, segno e spread')
+
+
 def test_all():
     test_dates_and_ecd_api()
     test_cds_api_download_mock()
+    test_temperature_bias_correction()
     init = datetime(2026, 10, 22, tzinfo=timezone.utc)
     starts = pipeline.week_starts(init)
     indices, thresholds = pipeline.load_assets()
