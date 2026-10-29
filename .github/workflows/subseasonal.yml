@@ -2,8 +2,8 @@ name: MeteoD ECMWF S2S
 
 on:
   schedule:
-    # Ogni giorno alle 04:30 UTC: run ECMWF delle 00 UTC di 2 giorni prima
-    - cron: '30 04 * * *'
+    # Ogni giorno alle 00:30 UTC: run ECMWF delle 00 UTC di 2 giorni prima
+    - cron: '30 00 * * *'
   workflow_dispatch:
     inputs:
       run_date:
